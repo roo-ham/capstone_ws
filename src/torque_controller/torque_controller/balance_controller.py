@@ -119,7 +119,7 @@ class BallBalancingNode(Node):
             [190.4393,  -7.3359,  -5.3972,   0.1569,   0.0036,   0.3956]
         ])
         try:
-            with open('force_coeffs.json', 'r') as f:
+            with open(os.path.expanduser('~/capstone_ws_claude/force_coeffs.json'), 'r') as f:
                 j = json.load(f)
             coeffs = np.array([
                 [j['sensors'][i][f'c{k}'] for k in range(6)]

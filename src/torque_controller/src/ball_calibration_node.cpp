@@ -77,8 +77,8 @@ public:
         for(int i=0; i<12; ++i) target_data_[i] = defaults[i];
 
         // 2. Config 자동 로드
-        load_tactile_config("tactile_config.json");
-        load_balance_config("balance_config.json");
+        load_tactile_config("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
+        load_balance_config("/home/kimdonghwi/capstone_ws_claude/balance_config.json");
 
         // 3. 백그라운드 SHM 연결 및 비전 처리 스레드 시작
         shm_thread_ = std::thread(&BallCalibrationNode::shm_loop, this);
@@ -521,7 +521,7 @@ public:
             s["c5"] = force_coeffs_[i][5];
             j["sensors"].push_back(s);
         }
-        std::ofstream out("force_coeffs.json");
+        std::ofstream out("/home/kimdonghwi/capstone_ws_claude/force_coeffs.json");
         out << j.dump(4);
         RCLCPP_INFO(this->get_logger(), "force_coeffs.json saved.");
     }
@@ -646,7 +646,7 @@ public:
             for (auto* b : node_->calib_btns_) b->setEnabled(false);
         });
         connect(btn_save_bal, &QPushButton::clicked, [this]() { node_->save_balance_config(); });
-        connect(btn_load_bal, &QPushButton::clicked, [this]() { node_->load_balance_config("balance_config.json"); });
+        connect(btn_load_bal, &QPushButton::clicked, [this]() { node_->load_balance_config("/home/kimdonghwi/capstone_ws_claude/balance_config.json"); });
 
         // 2. 상태 모니터링 텍스트 에디터 (실시간 상태 반영)
         status_text_ = new QTextEdit();

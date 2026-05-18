@@ -63,29 +63,25 @@ public:
 
             for (int i = 0; i < 3; ++i) {
                 sensors_[i].b_val = -sensors_[i].last_area;
-                sensors_[i].ref_baseline = sensors_[i].ref_brightness;
-                sensors_[i].warmup_count = 0;
-                // threshold 값은 유지 (thermal drift 보정용)
+                // ref_baseline, thresh 는 건드리지 않음 (독립적인 열 drift 보정)
             }
 
-            // Save b_val + ref state to JSON (persist across restarts)
+            // Save b_val to JSON (persist across restarts)
             {
-                std::ifstream file("tactile_config.json");
+                std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
                 json j;
                 if (file.is_open()) { file >> j; file.close(); }
                 if (j.contains("cameras")) {
                     for (int i = 0; i < 3; ++i) {
                         if (j["cameras"].size() > (size_t)i) {
                             j["cameras"][i]["b_slider"] = sensors_[i].b_val;
-                            j["cameras"][i]["ref_baseline"] = sensors_[i].ref_baseline;
-                            j["cameras"][i]["ref_brightness"] = sensors_[i].ref_brightness;
                         }
                     }
-                    std::ofstream out("tactile_config.json");
+                    std::ofstream out("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
                     if (out.is_open()) { out << j.dump(4); out.close(); }
                 }
             }
-            RCLCPP_INFO(this->get_logger(), "Set Force Zero: all 3 sensors updated + saved to JSON.");
+            RCLCPP_INFO(this->get_logger(), "Set Force Zero: b_val updated, ref intact. Saved to JSON.");
         });
 
         for (int i = 0; i < 3; ++i) {
@@ -114,7 +110,7 @@ public:
         // Save adaptive threshold state to JSON (persist across restarts)
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
-            std::ifstream file("tactile_config.json");
+            std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
             json j;
             if (file.is_open()) { file >> j; file.close(); }
             if (j.contains("cameras")) {
@@ -124,7 +120,7 @@ public:
                         j["cameras"][i]["ref_brightness"] = sensors_[i].ref_brightness;
                     }
                 }
-                std::ofstream out("tactile_config.json");
+                std::ofstream out("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
                 if (out.is_open()) { out << j.dump(4); out.close(); }
                 RCLCPP_INFO(this->get_logger(), "Adaptive threshold state saved to tactile_config.json");
             }
@@ -191,7 +187,7 @@ private:
     }
 
     void load_config() {
-        std::ifstream file("tactile_config.json");
+        std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
         if (file.is_open()) {
             json j;
             file >> j;
