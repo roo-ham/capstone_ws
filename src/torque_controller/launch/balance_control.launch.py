@@ -2,7 +2,8 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import TimerAction
+from launch.actions import TimerAction, DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
     pkg_name = 'torque_controller'
@@ -11,6 +12,9 @@ def generate_launch_description():
     with open(urdf_file, 'r') as inf:
         robot_desc = inf.read()
 
+    show_gui_arg = DeclareLaunchArgument('show_gui', default_value='false')
+    show_gui = LaunchConfiguration('show_gui')
+
     # 1. Robot State Publisher
     robot_state_publisher = Node(
         package='robot_state_publisher',
@@ -18,23 +22,14 @@ def generate_launch_description():
         parameters=[{'robot_description': robot_desc}]
     )
 
-    # 2. RViz2
-    rviz2 = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        # 필요한 경우 rviz 설정파일(.rviz) 경로 추가
-        output='screen'
-    )
-
-    # 3. Dynamixel 하드웨어 인터페이스 (가정)
+    # 2. Dynamixel hardware interface
     dynamixel_node = Node(
         package=pkg_name,
         executable='pub_posvel_sub_torque',
         name='dynamixel_interface'
     )
 
-    # 4. Spring-Damper 제어기 및 UI 노드
+    # 3. Spring-Damper controller
     control_ui_node = Node(
         package=pkg_name,
         executable='spring_damper_3axis'
@@ -43,22 +38,22 @@ def generate_launch_description():
     ball_tracker_node = Node(
         package=pkg_name,
         executable='tactile_ball_tracker_debug',
-        name='ball_tracker_node'
+        name='ball_tracker_node',
+        parameters=[{'show_gui': show_gui}]
     )
 
     balance_controller = Node(
         package=pkg_name,
         executable='balance_controller.py',
-        name='balance_controller'
+        name='balance_controller',
+        parameters=[{'show_gui': show_gui}]
     )
 
     return LaunchDescription([
+        show_gui_arg,
         robot_state_publisher,
-        # rviz2,
         dynamixel_node,
         ball_tracker_node,
         balance_controller,
         control_ui_node
-        # 하드웨어가 뜬 후 제어기가 동작하도록 약간의 지연 시간 부여
-        # TimerAction(period=2.0, actions=[control_ui_node])
     ])

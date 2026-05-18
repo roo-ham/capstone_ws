@@ -31,6 +31,14 @@ struct SensorData {
     cv::UMat u_mask;                    
 
     int thresh = 120;
+    int base_thresh = 120;
+
+    // Adaptive threshold: reference brightness tracking (drift compensation)
+    cv::Rect ref_roi = cv::Rect(5, 5, 30, 30);  // configurable via JSON
+    double ref_brightness = 0.0;
+    double ref_baseline = -1.0; // -1 = not initialized
+    int warmup_count = 0;       // baseline warmup counter
+    static constexpr int WARMUP_FRAMES = 200;
     double current_fps = 0.0;
     
     cv::Mat display_img;
@@ -45,44 +53,39 @@ public:
         init_shm();
         
         this->declare_parameter("fps_limit", 150);
-        this->declare_parameter("filter_alpha", 1.0); 
+        this->declare_parameter("filter_alpha", 1.0);
+        this->declare_parameter("show_gui", true);
 
         zero_sub_ = this->create_subscription<std_msgs::msg::Empty>(
                 "set_force_zero", 10,
                 [this](const std_msgs::msg::Empty::SharedPtr /*msg*/) {
             std::lock_guard<std::mutex> lock(data_mutex_);
-            
-            // 1. 메모리 상의 b_val 업데이트
+
             for (int i = 0; i < 3; ++i) {
                 sensors_[i].b_val = -sensors_[i].last_area;
+                sensors_[i].ref_baseline = sensors_[i].ref_brightness;
+                sensors_[i].warmup_count = 0;
+                // threshold 값은 유지 (thermal drift 보정용)
             }
-            
-            // 2. 기존 JSON 파일 읽어오기
-            std::ifstream file("tactile_config.json");
-            json j;
-            if (file.is_open()) {
-                file >> j;
-                file.close();
-                
-                // 3. JSON 객체의 b_slider 값 수정
-                for (int i = 0; i < 3; ++i) {
-                    if (j.contains("cameras") && j["cameras"].size() > i) {
-                        j["cameras"][i]["b_slider"] = sensors_[i].b_val;
+
+            // Save b_val + ref state to JSON (persist across restarts)
+            {
+                std::ifstream file("tactile_config.json");
+                json j;
+                if (file.is_open()) { file >> j; file.close(); }
+                if (j.contains("cameras")) {
+                    for (int i = 0; i < 3; ++i) {
+                        if (j["cameras"].size() > (size_t)i) {
+                            j["cameras"][i]["b_slider"] = sensors_[i].b_val;
+                            j["cameras"][i]["ref_baseline"] = sensors_[i].ref_baseline;
+                            j["cameras"][i]["ref_brightness"] = sensors_[i].ref_brightness;
+                        }
                     }
+                    std::ofstream out("tactile_config.json");
+                    if (out.is_open()) { out << j.dump(4); out.close(); }
                 }
-                
-                // 4. 수정된 JSON 객체를 파일에 덮어쓰기 (4칸 들여쓰기)
-                std::ofstream out_file("tactile_config.json");
-                if (out_file.is_open()) {
-                    out_file << j.dump(4);
-                    out_file.close();
-                    RCLCPP_INFO(this->get_logger(), "Set Force Zero Triggered. 'b' parameter updated and saved to JSON.");
-                } else {
-                    RCLCPP_ERROR(this->get_logger(), "Failed to open tactile_config.json for writing.");
-                }
-            } else {
-                RCLCPP_ERROR(this->get_logger(), "Failed to read tactile_config.json before writing.");
             }
+            RCLCPP_INFO(this->get_logger(), "Set Force Zero: all 3 sensors updated + saved to JSON.");
         });
 
         for (int i = 0; i < 3; ++i) {
@@ -107,7 +110,26 @@ public:
         for (auto& th : capture_threads_) {
             if (th.joinable()) th.join();
         }
-        
+
+        // Save adaptive threshold state to JSON (persist across restarts)
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            std::ifstream file("tactile_config.json");
+            json j;
+            if (file.is_open()) { file >> j; file.close(); }
+            if (j.contains("cameras")) {
+                for (int i = 0; i < 3; ++i) {
+                    if (j["cameras"].size() > (size_t)i) {
+                        j["cameras"][i]["ref_baseline"] = sensors_[i].ref_baseline;
+                        j["cameras"][i]["ref_brightness"] = sensors_[i].ref_brightness;
+                    }
+                }
+                std::ofstream out("tactile_config.json");
+                if (out.is_open()) { out << j.dump(4); out.close(); }
+                RCLCPP_INFO(this->get_logger(), "Adaptive threshold state saved to tactile_config.json");
+            }
+        }
+
         munmap(shm_ptr_, 4 * sizeof(double));
         close(fd_shm_);
         shm_unlink("ball_state_shm");
@@ -118,8 +140,8 @@ public:
         if (fd_pose_ != -1) {
             close(fd_pose_);
         }
-        
-        cv::destroyAllWindows(); 
+
+        if (show_gui_) cv::destroyAllWindows();
     }
 
 private:
@@ -136,7 +158,8 @@ private:
     std::mutex data_mutex_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr ui_timer_;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr zero_sub_; 
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr zero_sub_;
+    bool show_gui_ = true;
 
     rclcpp::Time last_time_;
 
@@ -189,6 +212,18 @@ private:
                 for(auto& pt : j["cameras"][i]["trap_src"]) {
                     sensors_[i].trap_pts.push_back(cv::Point(pt[0], pt[1]));
                 }
+                // reference ROI for adaptive threshold
+                if (j["cameras"][i].contains("ref_roi")) {
+                    auto& rr = j["cameras"][i]["ref_roi"];
+                    sensors_[i].ref_roi = cv::Rect(rr[0], rr[1], rr[2], rr[3]);
+                }
+                // restore adaptive threshold state (persist across restarts)
+                if (j["cameras"][i].contains("ref_baseline")) {
+                    sensors_[i].ref_baseline = j["cameras"][i]["ref_baseline"];
+                    sensors_[i].ref_brightness = j["cameras"][i].value("ref_brightness", sensors_[i].ref_baseline);
+                    sensors_[i].warmup_count = sensors_[i].WARMUP_FRAMES; // skip warmup
+                    RCLCPP_INFO(this->get_logger(), "[Sensor %d] Restored ref baseline: %.2f", i, sensors_[i].ref_baseline);
+                }
             }
             file.close();
         }
@@ -196,6 +231,7 @@ private:
 
     void update_terminal_ui() {
         int global_fps_limit = this->get_parameter("fps_limit").as_int();
+        show_gui_ = this->get_parameter("show_gui").as_bool();
         for(int i=0; i<3; ++i) sensors_[i].target_fps = global_fps_limit;
 
         std::vector<cv::Mat> disp_imgs(3);
@@ -209,8 +245,8 @@ private:
             printf(" Target FPS Limit: %d (Adjust via ROS Param)\n\n", global_fps_limit);
             
             for(int i=0; i<3; ++i) {
-                printf(" [Sensor %d] FPS: %5.1f | Score(Area): %7.1f | Force: %6.2f\n", 
-                       i+1, sensors_[i].current_fps, sensors_[i].last_area, sensors_[i].force);
+                printf(" [Sensor %d] FPS: %5.1f | Area: %7.1f | Force: %6.2f | Thresh: %3d | Ref: %6.1f\n",
+                       i+1, sensors_[i].current_fps, sensors_[i].last_area, sensors_[i].force, sensors_[i].thresh, sensors_[i].ref_brightness);
                 
                 if(!sensors_[i].display_img.empty()) {
                     disp_imgs[i] = sensors_[i].display_img.clone();
@@ -220,13 +256,14 @@ private:
         }
         fflush(stdout);
 
-        for(int i=0; i<3; ++i) {
-            if(!disp_imgs[i].empty()) {
-                cv::imshow("Camera " + std::to_string(i) + " Binary", disp_imgs[i]);
+        if (show_gui_) {
+            for(int i=0; i<3; ++i) {
+                if(!disp_imgs[i].empty()) {
+                    cv::imshow("Camera " + std::to_string(i) + " Binary", disp_imgs[i]);
+                }
             }
+            cv::waitKey(1);
         }
-
-        cv::waitKey(1); 
     }
 
     void camera_thread_func(int idx) {
@@ -243,7 +280,29 @@ private:
                 if (sensors_[idx].u_mask.empty() && !sensors_[idx].trap_pts.empty()) {
                     cv::Mat temp_mask = cv::Mat::zeros(frame.size(), CV_8UC1);
                     cv::fillConvexPoly(temp_mask, sensors_[idx].trap_pts, cv::Scalar(255));
-                    temp_mask.copyTo(sensors_[idx].u_mask); 
+                    temp_mask.copyTo(sensors_[idx].u_mask);
+                }
+
+                // --- Adaptive threshold: JSON-configurable ROI + warmup ---
+                cv::Rect roi = sensors_[idx].ref_roi;
+                // clamp ROI within frame bounds
+                if (roi.x + roi.width > frame.cols) roi.width = frame.cols - roi.x;
+                if (roi.y + roi.height > frame.rows) roi.height = frame.rows - roi.y;
+                cv::Mat ref_patch = frame(roi);
+                double raw_ref = cv::mean(ref_patch)[0];
+                sensors_[idx].ref_brightness = 0.995 * sensors_[idx].ref_brightness + 0.005 * raw_ref;
+
+                // warmup: wait WARMUP_FRAMES before locking baseline
+                if (sensors_[idx].ref_baseline < 0.0) {
+                    if (++sensors_[idx].warmup_count >= sensors_[idx].WARMUP_FRAMES) {
+                        sensors_[idx].ref_baseline = sensors_[idx].ref_brightness;
+                    }
+                }
+                if (sensors_[idx].ref_baseline > 0.0) {
+                    double ratio = sensors_[idx].ref_brightness / sensors_[idx].ref_baseline;
+                    sensors_[idx].thresh = (int)(sensors_[idx].base_thresh * ratio);
+                    if (sensors_[idx].thresh < 80)  sensors_[idx].thresh = 80;
+                    if (sensors_[idx].thresh > 180) sensors_[idx].thresh = 180;
                 }
 
                 cv::threshold(u_frame, u_binary, sensors_[idx].thresh, 255, cv::THRESH_BINARY);
@@ -385,7 +444,6 @@ private:
 
             cv::Mat frame;
             auto last_frame_time = std::chrono::steady_clock::now();
-            auto last_enforce_time = std::chrono::steady_clock::now(); // 설정 강제 주기용 타이머
             int frame_count = 0;
 
             while (running_ && rclcpp::ok()) {
@@ -397,12 +455,6 @@ private:
                 frame_count++;
                 auto now = std::chrono::steady_clock::now();
                 
-                // [수정 3] 소프트웨어적 강제 유지: 10초(10.0s)마다 파라미터를 재전송하여 펌웨어 드리프팅 원천 차단
-                if (std::chrono::duration<double>(now - last_enforce_time).count() >= 10.0) {
-                    apply_camera_settings();
-                    last_enforce_time = now;
-                }
-
                 // FPS 계산 로직
                 double elapsed_sec = std::chrono::duration<double>(now - last_frame_time).count();
                 if (elapsed_sec >= 1.0) {

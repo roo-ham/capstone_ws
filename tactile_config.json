@@ -1,8 +1,16 @@
 {
     "cameras": [
         {
-            "b_slider": -4646.519420139943,
-            "k_slider": 0.009776986712234764,
+            "b_slider": -4192.0,
+            "k_slider": 0.0326199947455911,
+            "ref_baseline": 7.4284524017410245,
+            "ref_brightness": 6.2959100517530455,
+            "ref_roi": [
+                40,
+                350,
+                30,
+                30
+            ],
             "rpicam_cmd": "rpicam-vid -t 0 --camera 0 --width 640 --height 400 --framerate 120 --codec yuv420 --denoise off --nopreview --awb custom --awbgains 1.5,1.5 --shutter 40000 --gain 7.0 -o - 2>/dev/null",
             "source": "1",
             "trap_src": [
@@ -26,32 +34,48 @@
             "zero_area": 0.0
         },
         {
-            "b_slider": -8782.150846234168,
-            "k_slider": 0.014928879626304788,
+            "b_slider": -74157.0,
+            "k_slider": 0.004394303896206329,
+            "ref_baseline": 108.24379395242045,
+            "ref_brightness": 110.2723482535358,
+            "ref_roi": [
+                40,
+                350,
+                30,
+                30
+            ],
             "source": "/dev/v4l/by-id/usb-Arducam_Technology_Co.__Ltd._Arducam_OV9281_USB_Camera_UC762-video-index0",
             "trap_src": [
                 [
-                    160,
-                    150
+                    50,
+                    50
                 ],
                 [
-                    480,
-                    150
+                    590,
+                    50
                 ],
                 [
-                    360,
+                    500,
                     400
                 ],
                 [
-                    250,
+                    140,
                     400
                 ]
             ],
             "zero_area": 0.0
         },
         {
-            "b_slider": -218.96050463144002,
-            "k_slider": 0.05407229380382619,
+            "b_slider": -286.0,
+            "k_slider": 0.037126798724105625,
+            "ref_baseline": 31.619894096206256,
+            "ref_brightness": 26.02824088673376,
+            "ref_roi": [
+                40,
+                350,
+                30,
+                30
+            ],
             "rpicam_cmd": "rpicam-vid -t 0 --camera 1 --width 640 --height 400 --framerate 120 --codec yuv420 --denoise off --nopreview --awb custom --awbgains 1.5,1.5 --shutter 50000 --gain 10.0 -o - 2>/dev/null",
             "source": "0",
             "trap_src": [

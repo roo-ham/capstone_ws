@@ -52,12 +52,8 @@ class BallBalancingNode(Node):
         self.curr_f1_raw = 0.0; self.curr_f2_raw = 0.0; self.curr_f3_raw = 0.0
         self.curr_f1_res = 0.0; self.curr_f2_res = 0.0; self.curr_f3_res = 0.0
 
-        # 판 무게 하중 보정 2차 함수 계수
-        self.force_coeffs = np.array([
-            [140.2043,  -4.0341,  -4.5639,  -0.1540,  -0.2591,  -0.1475],  # Sensor 1
-            [140.4777,  -2.8153,  -5.5666,   0.1469,   0.0259,   0.6568],  # Sensor 2
-            [190.4393,  -7.3359,  -5.3972,   0.1569,   0.0036,   0.3956]   # Sensor 3
-        ])
+        # 판 무게 하중 보정 2차 함수 계수 (force_coeffs.json 우선, 없으면 기본값)
+        self.force_coeffs = self.load_force_coeffs()
         
         # 공 위치 추정 계수
         self.poly_coeffs_x = np.array([
@@ -92,11 +88,72 @@ class BallBalancingNode(Node):
         self.config_file = 'balance_config.json'
         self.load_config()
 
+        # --- Kalman Filter 초기화 ---
+        self.kf_dt = self.dt
+        self.kf_g = 9.81
+        self.kf_x = np.zeros(4)       # [x, y, vx, vy]
+        self.kf_P = np.diag([0.01, 0.01, 0.1, 0.1])
+        # State transition matrix
+        dt = self.kf_dt
+        self.kf_F = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]])
+        # Control matrix: [θ_pitch, -θ_roll] → ball accel
+        self.kf_B = np.array([[9.81*dt**2/2, 0],[0, -9.81*dt**2/2],[9.81*dt,0],[0,-9.81*dt]])
+        # Measurement matrix
+        self.kf_H = np.array([[1,0,0,0],[0,1,0,0]])
+        # Process noise (small: ~2% of tilt accel, rolling resistance etc.)
+        q = 0.02 * 9.81 * 0.17
+        self.kf_Q = np.diag([q**2*dt**4/4, q**2*dt**4/4, q**2*dt**2, q**2*dt**2])
+
         self.zero_pub = self.create_publisher(Empty, 'set_force_zero', 10)
         self.get_logger().info("Ball Balancing Node Starting...")
 
+        self.declare_parameter('show_gui', True)
+        self.show_gui = self.get_parameter('show_gui').value
         self.shutdown_flag = False
         self.pause_control()
+
+    def load_force_coeffs(self):
+        defaults = np.array([
+            [140.2043,  -4.0341,  -4.5639,  -0.1540,  -0.2591,  -0.1475],
+            [140.4777,  -2.8153,  -5.5666,   0.1469,   0.0259,   0.6568],
+            [190.4393,  -7.3359,  -5.3972,   0.1569,   0.0036,   0.3956]
+        ])
+        try:
+            with open('force_coeffs.json', 'r') as f:
+                j = json.load(f)
+            coeffs = np.array([
+                [j['sensors'][i][f'c{k}'] for k in range(6)]
+                for i in range(3)
+            ])
+            self.get_logger().info(f"Loaded force_coeffs from JSON: c0=[{coeffs[0][0]:.1f}, {coeffs[1][0]:.1f}, {coeffs[2][0]:.1f}]")
+            return coeffs
+        except Exception as e:
+            self.get_logger().error(f"force_coeffs.json load failed: {e}")
+            return defaults
+
+    def kf_predict(self, u_pitch, u_roll):
+        """Kalman predict step: tilt command → ball acceleration"""
+        u = np.array([u_pitch, u_roll])
+        self.kf_x = self.kf_F @ self.kf_x + self.kf_B @ u
+        self.kf_P = self.kf_F @ self.kf_P @ self.kf_F.T + self.kf_Q
+
+    def kf_update(self, z_x, z_y, f_total):
+        """Kalman update step: CoP measurement with adaptive R"""
+        if f_total < 0:
+            return  # dead measurement, skip update
+        elif f_total < 10:
+            r_val = 1e-4   # 1cm² var
+        elif f_total < 30:
+            r_val = 1e-6   # 1mm² var
+        else:
+            r_val = 1e-8   # 0.1mm² var
+        R = np.array([[r_val, 0], [0, r_val]])
+        z = np.array([z_x, z_y])
+        y = z - self.kf_H @ self.kf_x  # innovation
+        S = self.kf_H @ self.kf_P @ self.kf_H.T + R
+        K = self.kf_P @ self.kf_H.T @ np.linalg.inv(S)
+        self.kf_x = self.kf_x + K @ y
+        self.kf_P = (np.eye(4) - K @ self.kf_H) @ self.kf_P
 
     def get_expected_force(self, roll_deg, pitch_deg, sensor_idx):
         c = self.force_coeffs[sensor_idx]
@@ -124,10 +181,6 @@ class BallBalancingNode(Node):
                     self.Kp_ball = cfg.get('Kp_ball', self.Kp_ball)
                     self.Kd_ball = cfg.get('Kd_ball', self.Kd_ball)
 
-                    self.force_coeffs[0][0] = cfg.get('force_c0_s1', 140.2043)
-                    self.force_coeffs[1][0] = cfg.get('force_c0_s2', 140.4777)
-                    self.force_coeffs[2][0] = cfg.get('force_c0_s3', 190.4393)
-
                     for i in range(5, 12):
                         idx_str = str(i)
                         if idx_str in cfg.get('target_data', {}):
@@ -151,7 +204,14 @@ class BallBalancingNode(Node):
         try:
             with open(self.config_file, 'w') as f:
                 json.dump(cfg, f, indent=4)
-            self.get_logger().info("Configuration saved successfully.")
+            # also save force_coeffs (c0 may have been adjusted via UI sliders)
+            fc = {'sensors': [
+                {f'c{j}': self.force_coeffs[i][j] for j in range(6)}
+                for i in range(3)
+            ]}
+            with open('force_coeffs.json', 'w') as ff:
+                json.dump(fc, ff, indent=4)
+            self.get_logger().info("Configuration + force_coeffs saved successfully.")
         except Exception as e:
             self.get_logger().error(f"Failed to save config: {e}")
 
@@ -180,7 +240,7 @@ class BallBalancingNode(Node):
                 self.pose_array = np.ndarray((12,), dtype=np.float64, buffer=self.shm_pose.buf)
                 
                 self.shm_eef = shared_memory.SharedMemory(name='eef_pos_shm', create=False)
-                self.eef_array = np.ndarray((6,), dtype=np.float64, buffer=self.shm_eef.buf)
+                self.eef_array = np.ndarray((9,), dtype=np.float64, buffer=self.shm_eef.buf)
                 
                 self.shm_eef_force = shared_memory.SharedMemory(name='eef_force_shm', create=False)
                 self.eef_force_array = np.ndarray((3,), dtype=np.float64, buffer=self.shm_eef_force.buf)
@@ -240,60 +300,43 @@ class BallBalancingNode(Node):
             self.curr_f2_res = self.curr_f2_raw - f2_exp
             self.curr_f3_res = self.curr_f3_raw - f3_exp
 
-            MIN_FORCE = -30
-            if self.curr_f1_res < MIN_FORCE: self.curr_f1_res = MIN_FORCE
-            if self.curr_f2_res < MIN_FORCE: self.curr_f2_res = MIN_FORCE
-            if self.curr_f3_res < MIN_FORCE: self.curr_f3_res = MIN_FORCE
-
-            # --- 5. CoP → 공 위치 추정 (보상된 힘 사용) ---
+            # --- 5. CoP 계산 (raw measurement) ---
             f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res
 
-            avg_eef_x = (self.eef_array[0] + self.eef_array[2] + self.eef_array[4]) / 3.0
-            avg_eef_y = (self.eef_array[1] + self.eef_array[3] + self.eef_array[5]) / 3.0
+            avg_eef_x = (self.eef_array[0] + self.eef_array[3] + self.eef_array[6]) / 3.0
+            avg_eef_y = (self.eef_array[1] + self.eef_array[4] + self.eef_array[7]) / 3.0
 
-            if f_total <= 0.0:
+            if f_total > 0.0:
+                cop_x = (self.eef_array[0] * self.curr_f1_res +
+                         self.eef_array[3] * self.curr_f2_res +
+                         self.eef_array[6] * self.curr_f3_res) / f_total
+                cop_y = (self.eef_array[1] * self.curr_f1_res +
+                         self.eef_array[4] * self.curr_f2_res +
+                         self.eef_array[7] * self.curr_f3_res) / f_total
+                bx = cop_x - avg_eef_x
+                by = cop_y - avg_eef_y
+            else:
                 bx = 0.0
                 by = 0.0
-            else:
-                cop_x = (self.eef_array[0] * self.curr_f1_res +
-                         self.eef_array[2] * self.curr_f2_res +
-                         self.eef_array[4] * self.curr_f3_res) / f_total
-                cop_y = (self.eef_array[1] * self.curr_f1_res +
-                         self.eef_array[3] * self.curr_f2_res +
-                         self.eef_array[5] * self.curr_f3_res) / f_total
 
-                rel_x = cop_x - avg_eef_x
-                rel_y = cop_y - avg_eef_y
+            # --- 6. Kalman Filter: 공 상태 추정 ---
+            # Predict: tilt command → expected ball dynamics
+            pitch_cmd = self.target_data[4] - self.pitch_offset_rad
+            roll_cmd = -(self.target_data[3] - self.roll_offset_rad)
+            self.kf_predict(pitch_cmd, roll_cmd)
 
-                if f_total < F_TOTAL_MIN:
-                    alpha = f_total / F_TOTAL_MIN
-                    bx = rel_x * alpha
-                    by = rel_y * alpha
-                else:
-                    bx = rel_x
-                    by = rel_y
+            # Update: CoP measurement (adaptive R based on f_total)
+            if f_total > 0:
+                self.kf_update(bx, by, f_total)
 
-            # --- 6. 공 상태 갱신 (이동평균 속도 필터) ---
-            if f_total >= F_TOTAL_MIN:
-                self.ball_detected = True
-                raw_vx = (bx - self.curr_ball_x) / self.dt
-                raw_vy = (by - self.curr_ball_y) / self.dt
+            # Use Kalman state for ball position/velocity
+            self.curr_ball_x = self.kf_x[0]
+            self.curr_ball_y = self.kf_x[1]
+            self.curr_ball_vx = self.kf_x[2]
+            self.curr_ball_vy = self.kf_x[3]
 
-                self.v_history[self.v_history_idx] = [raw_vx, raw_vy]
-                self.v_history_idx = (self.v_history_idx + 1) % 5
-                self.curr_ball_vx = np.mean(self.v_history[:, 0])
-                self.curr_ball_vy = np.mean(self.v_history[:, 1])
-
-                self.curr_ball_x = bx
-                self.curr_ball_y = by
-                self.prev_ball_detected = True
-            else:
-                self.ball_detected = False
-                self.prev_ball_detected = False
-                self.curr_ball_vx = 0.0
-                self.curr_ball_vy = 0.0
-                self.curr_ball_x = bx
-                self.curr_ball_y = by
+            self.ball_detected = (f_total >= F_TOTAL_MIN)
+            self.prev_ball_detected = self.ball_detected or self.prev_ball_detected
 
             # --- 7. PD 제어 + Z속도 기반 적응형 게인 ---
             z_vel_mag = abs(self.z_vel_filt)
@@ -320,13 +363,23 @@ class BallBalancingNode(Node):
             self.pose_array[:] = self.target_data[:]
 
             # --- 8. CSV 로깅 ---
+            eef_vel = list(self.eef_dot_array) if self.eef_dot_array is not None else [0.0]*9
+            eef_cur = list(self.eef_force_array) if (self.shm_connected_pose and self.eef_force_array is not None) else [0.0]*3
+            f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res
+            cop_x_raw = (self.eef_array[0]*self.curr_f1_res + self.eef_array[3]*self.curr_f2_res + self.eef_array[6]*self.curr_f3_res) if f_total > 0 else 0.0
+            cop_y_raw = (self.eef_array[1]*self.curr_f1_res + self.eef_array[4]*self.curr_f2_res + self.eef_array[7]*self.curr_f3_res) if f_total > 0 else 0.0
             self.csv_data.append([
                 now, self.target_data[3], self.target_data[4],
                 self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw,
                 self.curr_f1_res, self.curr_f2_res, self.curr_f3_res,
+                f1_exp, f2_exp, f3_exp,
                 self.curr_ball_x, self.curr_ball_y, self.curr_ball_vx, self.curr_ball_vy,
-                self.z_vel_filt, gain_scale
-            ])
+                self.z_vel_filt, gain_scale,
+                self.target_data[2], self.target_data[5], self.target_data[6],
+                cop_x_raw, cop_y_raw, f_total,
+                bx, by,  # raw CoP before Kalman
+                self.kf_P.trace()
+            ] + eef_vel + eef_cur)
 
         except Exception as e:
             self.get_logger().error(f"Error in control loop: {e}")
@@ -337,7 +390,7 @@ class BallBalancingNode(Node):
         if self.shm_eef: self.shm_eef.close()
         if self.shm_eef_force: self.shm_eef_force.close()
         if self.shm_eef_dot: self.shm_eef_dot.close()
-        cv2.destroyAllWindows()  # OpenCV 윈도우 파괴 추가
+        if self.show_gui: cv2.destroyAllWindows()
         super().destroy_node()
 
 class TuningUI:
@@ -498,7 +551,8 @@ class TuningUI:
         btn_zero.pack(fill='x', pady=2)
 
         # [추가] OpenCV 실시간 모니터링 윈도우 생성 초기화
-        cv2.namedWindow("Ball & EEF Position Map", cv2.WINDOW_AUTOSIZE)
+        if self.node.show_gui:
+            cv2.namedWindow("Ball & EEF Position Map", cv2.WINDOW_AUTOSIZE)
 
         self.update_ui_loop()
 
@@ -590,66 +644,48 @@ class TuningUI:
             self.lbl_eef_force.config(text=f"EEF Forces (gf) - F1: {self.node.eef_force_array[0]:>6.1f} | F2: {self.node.eef_force_array[1]:>6.1f} | F3: {self.node.eef_force_array[2]:>6.1f}")
 
         # 2. [신설] OpenCV 500x500 실시간 위치 시각화 맵 드로잉 모듈
-        # 흰색 배경 매트릭스 생성 (500x500, 3채널 BGR)
-        canvas = np.ones((500, 500, 3), dtype=np.uint8) * 255
+        if self.node.show_gui:
+            try:
+                canvas = np.ones((500, 500, 3), dtype=np.uint8) * 255
+                cv2.line(canvas, (250, 0), (250, 500), (220, 220, 220), 1)
+                cv2.line(canvas, (0, 250), (500, 250), (220, 220, 220), 1)
+                cv2.putText(canvas, "+X (mm)", (430, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
+                cv2.putText(canvas, "+Y (mm)", (255, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
 
-        # 기본 십자 그리드 축 레이아웃 드로잉 (Center: 250, 250)
-        cv2.line(canvas, (250, 0), (250, 500), (220, 220, 220), 1)
-        cv2.line(canvas, (0, 250), (500, 250), (220, 220, 220), 1)
-        cv2.putText(canvas, "+X (mm)", (430, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "+Y (mm)", (255, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
+                if self.node.shm_connected_pose and self.node.eef_array is not None:
+                    for i in range(3):
+                        eef_x_m = self.node.eef_array[3 * i]
+                        eef_y_m = self.node.eef_array[3 * i + 1]
+                        pixel_ex = int(250 + (eef_x_m * 1000.0))
+                        pixel_ey = int(250 - (eef_y_m * 1000.0))
+                        pixel_ex = np.clip(pixel_ex, 0, 499)
+                        pixel_ey = np.clip(pixel_ey, 0, 499)
+                        cv2.rectangle(canvas, (pixel_ex - 5, pixel_ey - 5), (pixel_ex + 5, pixel_ey + 5), (0, 180, 0), -1)
+                        cv2.putText(canvas, f"E{i+1}", (pixel_ex + 7, pixel_ey + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 130, 0), 1, cv2.LINE_AA)
 
-        # 2-1. EEF 가이드 포지션 (1, 2, 3번 센서 원형 팁 위치) 추출 및 드로잉
-        if self.node.shm_connected_pose and self.node.eef_array is not None:
-            # eef_array구조: [s1_x, s1_y, s2_x, s2_y, s3_x, s3_y] 단위: m
-            for i in range(3):
-                eef_x_m = self.node.eef_array[2 * i]
-                eef_y_m = self.node.eef_array[2 * i + 1]
+                ball_x_m = self.node.curr_ball_x
+                ball_y_m = self.node.curr_ball_y
+                pixel_bx = int(250 + (ball_x_m * 1000.0))
+                pixel_by = int(250 - (ball_y_m * 1000.0))
+                pixel_bx = np.clip(pixel_bx, 0, 499)
+                pixel_by = np.clip(pixel_by, 0, 499)
 
-                # 단위 스케일 변환: m -> mm (즉, 픽셀 오프셋 크기)
-                # 이미지 좌표계 매핑: 픽셀 Y축은 아래로 갈수록 커지므로 실제 물리 평면 +Y 방향 매핑을 위해 뺄셈 처리
-                pixel_ex = int(250 + (eef_x_m * 1000.0))
-                pixel_ey = int(250 - (eef_y_m * 1000.0))
+                if self.node.ball_detected:
+                    cv2.circle(canvas, (pixel_bx, pixel_by), 7, (0, 0, 255), -1)
+                    cv2.circle(canvas, (pixel_bx, pixel_by), 8, (0, 0, 130), 1, cv2.LINE_AA)
+                    cv2.putText(canvas, "Ball", (pixel_bx + 10, pixel_by - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
+                else:
+                    cv2.circle(canvas, (pixel_bx, pixel_by), 6, (180, 180, 180), -1)
+                    cv2.putText(canvas, "Lost", (pixel_bx + 10, pixel_by - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
 
-                # 도화지 영역 밖 예외 바운더리 클램핑
-                pixel_ex = np.clip(pixel_ex, 0, 499)
-                pixel_ey = np.clip(pixel_ey, 0, 499)
-
-                # 초록색 사각형(Rectangle)으로 말단 센서 위치 표기
-                cv2.rectangle(canvas, (pixel_ex - 5, pixel_ey - 5), (pixel_ex + 5, pixel_ey + 5), (0, 180, 0), -1)
-                cv2.putText(canvas, f"E{i+1}", (pixel_ex + 7, pixel_ey + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 130, 0), 1, cv2.LINE_AA)
-
-        # 2-2. 실시간 계산된 공(Ball) 포지션 드로잉
-        # 공 상태 값이 유효하거나 검출 중일 때만 연산 주입
-        ball_x_m = self.node.curr_ball_x
-        ball_y_m = self.node.curr_ball_y
-
-        pixel_bx = int(250 + (ball_x_m * 1000.0))
-        pixel_by = int(250 - (ball_y_m * 1000.0))
-
-        pixel_bx = np.clip(pixel_bx, 0, 499)
-        pixel_by = np.clip(pixel_by, 0, 499)
-
-        if self.node.ball_detected:
-            # 공이 감지되었을 때는 선명한 빨간색(Red) 원으로 채움
-            cv2.circle(canvas, (pixel_bx, pixel_by), 7, (0, 0, 255), -1)
-            cv2.circle(canvas, (pixel_bx, pixel_by), 8, (0, 0, 130), 1, cv2.LINE_AA)
-            cv2.putText(canvas, "Ball", (pixel_bx + 10, pixel_by - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
-        else:
-            # 공 미검출 시 직전 값 혹은 중심 기준 위치를 흐린 회색(Grey) 원으로 알파 마킹
-            cv2.circle(canvas, (pixel_bx, pixel_by), 6, (180, 180, 180), -1)
-            cv2.putText(canvas, "Lost", (pixel_bx + 10, pixel_by - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
-
-        # OpenCV 프레임 렌더링 버퍼 밀어내기
-        try:
-            cv2.imshow("Ball & EEF Position Map", canvas)
-            cv2.waitKey(1)
-        except KeyboardInterrupt:
-            self.node.shutdown_flag = True
-            self.root.quit()
-            return
-        except Exception:
-            pass
+                cv2.imshow("Ball & EEF Position Map", canvas)
+                cv2.waitKey(1)
+            except KeyboardInterrupt:
+                self.node.shutdown_flag = True
+                self.root.quit()
+                return
+            except Exception:
+                pass
 
         # 100ms 주기로 Tkinter UI 및 OpenCV 타일 맵 리프레시 틱 가동
         self.root.after(100, self.update_ui_loop)
@@ -678,8 +714,16 @@ def main(args=None):
                         'timestamp', 'roll_rad', 'pitch_rad',
                         'f1_raw', 'f2_raw', 'f3_raw',
                         'f1_res', 'f2_res', 'f3_res',
+                        'f1_exp', 'f2_exp', 'f3_exp',
                         'ball_x', 'ball_y', 'ball_vx', 'ball_vy',
-                        'z_vel_filt', 'gain_scale'
+                        'z_vel_filt', 'gain_scale',
+                        'xyz_des_z', 'K_task', 'D_task',
+                        'cop_x_raw', 'cop_y_raw', 'f_total',
+                        'cop_x_meas', 'cop_y_meas', 'kf_P_trace',
+                        'eef_v1_x', 'eef_v1_y', 'eef_v1_z',
+                        'eef_v2_x', 'eef_v2_y', 'eef_v2_z',
+                        'eef_v3_x', 'eef_v3_y', 'eef_v3_z',
+                        'eef_cur_1', 'eef_cur_2', 'eef_cur_3'
                     ])
                     writer.writerows(node.csv_data)
                 print(f"\n[CSV 저장] '{filename}'에 데이터를 성공적으로 저장했습니다.")

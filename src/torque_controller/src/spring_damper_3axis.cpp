@@ -45,7 +45,7 @@ public:
         munmap(state_ptr_, 2 * 12 * sizeof(double));
         munmap(cmd_ptr_, 12 * sizeof(double));
         if (pose_ptr_) munmap(pose_ptr_, 12 * sizeof(double));
-        if (eef_ptr_) munmap(eef_ptr_, 6 * sizeof(double));
+        if (eef_ptr_) munmap(eef_ptr_, 9 * sizeof(double));
         if (eef_dot_ptr_) munmap(eef_dot_ptr_, 9 * sizeof(double));
         if (eef_force_ptr_) munmap(eef_force_ptr_, 3 * sizeof(double)); // [신설] 메모리 해제
         
@@ -156,11 +156,11 @@ private:
         pose_ptr_[9] = F_FRIC_BIAS_;
         pose_ptr_[10] = FRIC_V_COMPENSATE_;
 
-        // --- 2. EEF Position SHM (S->B, 6차원 강제 생성) ---
+        // --- 2. EEF Position SHM (S->B, 9차원: 3 fingers × XYZ global frame) ---
         shm_unlink("eef_pos_shm");
         int fd_eef = shm_open("eef_pos_shm", O_CREAT | O_RDWR, 0666);
-        ftruncate(fd_eef, 6 * sizeof(double));
-        eef_ptr_ = (double*)mmap(0, 6 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef, 0);
+        ftruncate(fd_eef, 9 * sizeof(double));
+        eef_ptr_ = (double*)mmap(0, 9 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef, 0);
 
         // --- 3. EEF Dot SHM (S->B, 9차원: 3 fingers × XYZ velocity in global frame) ---
         shm_unlink("eef_dot_shm");
@@ -277,10 +277,11 @@ private:
                 Eigen::Vector3d k_rp = i_pitch.cross(j_roll);
                 Eigen::Vector3d e_rp = k_rp.cross(eef_y);
 
-                // --- [SHM 기록] S -> B ---
+                // --- [SHM 기록] S -> B (9차원: XYZ global frame) ---
                 if (eef_ptr_ != nullptr) {
-                    eef_ptr_[i * 2] = i_pitch.dot(curr_pos_[i]);
-                    eef_ptr_[i * 2 + 1] = j_roll.dot(curr_pos_[i]);
+                    eef_ptr_[i * 3 + 0] = i_pitch.dot(curr_pos_[i]);
+                    eef_ptr_[i * 3 + 1] = j_roll.dot(curr_pos_[i]);
+                    eef_ptr_[i * 3 + 2] = curr_pos_[i].z();
                 }
 
                 // --- [수정] eef_dot_shm: 각 손가락의 XYZ 속도(global frame) 기록 (S -> B) ---

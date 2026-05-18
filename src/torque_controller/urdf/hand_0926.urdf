@@ -399,7 +399,7 @@
       </inertial>
    </link>
    <joint name="F2EEF" type="fixed">
-      <origin xyz="-0.007 0.065 -0.02" rpy="0 0 0.785398" />
+      <origin xyz="-0.007 0.065 -0.02" rpy="0 0 0.65" />
       <parent link="FL24" />
       <child link="FL2EEF" />
    </joint>
@@ -415,7 +415,7 @@
    </link>
    <joint name="F3EEF" type="fixed">
       <!-- 0.785398  = 45 degree -->
-      <origin xyz="-0.007 0.065 -0.02" rpy="0 0 0.82" />
+      <origin xyz="-0.007 0.065 -0.02" rpy="0 0 0.785398" />
       <parent link="FL34" />
       <child link="FL3EEF" />
    </joint>

@@ -26,3 +26,9 @@ log/
 
 # Claude
 .claude/
+
+# Backups
+*.bak
+
+# Misc
+my_photo.jpg
