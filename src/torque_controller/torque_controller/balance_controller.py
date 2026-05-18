@@ -14,6 +14,8 @@ import csv
 import cv2  # OpenCV 추가
 
 F_TOTAL_MIN = 10
+PLATE_MASS = 0.2347  # kg
+N_TO_GF = 101.97162
 
 class BallBalancingNode(Node):
     def __init__(self):
@@ -33,8 +35,10 @@ class BallBalancingNode(Node):
         self.pose_array = None
         self.shm_eef = None
         self.eef_array = None
-        self.shm_eef_force = None 
-        self.eef_force_array = None 
+        self.shm_eef_force = None
+        self.eef_force_array = None
+        self.shm_eef_dot = None
+        self.eef_dot_array = None
         
         self.shm_connected_ball = False
         self.shm_connected_pose = False
@@ -72,6 +76,10 @@ class BallBalancingNode(Node):
         self.target_ball_vx = 0.0; self.target_ball_vy = 0.0
 
         self.v_history = np.zeros((5, 2))
+        self.v_history_idx = 0
+
+        # Z-axis velocity estimation (게인 스케줄링용)
+        self.z_vel_filt = 0.0
 
         # 기본 게인 초기화
         self.Kp_ball = 1.0
@@ -87,9 +95,8 @@ class BallBalancingNode(Node):
         self.zero_pub = self.create_publisher(Empty, 'set_force_zero', 10)
         self.get_logger().info("Ball Balancing Node Starting...")
 
+        self.shutdown_flag = False
         self.pause_control()
-        self.state = 0
-        self.state_wait = 0
 
     def get_expected_force(self, roll_deg, pitch_deg, sensor_idx):
         c = self.force_coeffs[sensor_idx]
@@ -168,7 +175,7 @@ class BallBalancingNode(Node):
                 pass
 
         if not self.shm_connected_pose:
-            if os.path.exists('/dev/shm/target_pose_shm') and os.path.exists('/dev/shm/eef_pos_shm') and os.path.exists('/dev/shm/eef_force_shm'):
+            if os.path.exists('/dev/shm/target_pose_shm') and os.path.exists('/dev/shm/eef_pos_shm') and os.path.exists('/dev/shm/eef_force_shm') and os.path.exists('/dev/shm/eef_dot_shm'):
                 self.shm_pose = shared_memory.SharedMemory(name='target_pose_shm', create=False)
                 self.pose_array = np.ndarray((12,), dtype=np.float64, buffer=self.shm_pose.buf)
                 
@@ -177,17 +184,21 @@ class BallBalancingNode(Node):
                 
                 self.shm_eef_force = shared_memory.SharedMemory(name='eef_force_shm', create=False)
                 self.eef_force_array = np.ndarray((3,), dtype=np.float64, buffer=self.shm_eef_force.buf)
-                
+
+                self.shm_eef_dot = shared_memory.SharedMemory(name='eef_dot_shm', create=False)
+                self.eef_dot_array = np.ndarray((9,), dtype=np.float64, buffer=self.shm_eef_dot.buf)
+
                 from multiprocessing.resource_tracker import unregister
                 unregister(self.shm_pose._name, 'shared_memory')
                 unregister(self.shm_eef._name, 'shared_memory')
                 unregister(self.shm_eef_force._name, 'shared_memory')
+                unregister(self.shm_eef_dot._name, 'shared_memory')
                 
                 self.pose_array[:] = self.target_data[:]
                 self.shm_connected_pose = True
 
     def control_loop(self):
-        if self.shm_connected_pose and (not os.path.exists('/dev/shm/target_pose_shm') or not os.path.exists('/dev/shm/eef_pos_shm') or not os.path.exists('/dev/shm/eef_force_shm')):
+        if self.shm_connected_pose and (not os.path.exists('/dev/shm/target_pose_shm') or not os.path.exists('/dev/shm/eef_pos_shm') or not os.path.exists('/dev/shm/eef_force_shm') or not os.path.exists('/dev/shm/eef_dot_shm')):
             os._exit(0)
 
         self.loop_count += 1
@@ -202,11 +213,21 @@ class BallBalancingNode(Node):
             return
 
         try:
-            eef_force_data = list(self.eef_force_array) if (self.shm_connected_pose and self.eef_force_array is not None) else [0.0]*3
-
+            # --- 1. 원시 힘 데이터 읽기 ---
             curr_raw = np.array(self.ball_state_array)
             self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw, _ = curr_raw
 
+            # --- 2. 손가락 Z속도(global frame) 평균 → 게인 스케줄링용 ---
+            if self.eef_dot_array is not None:
+                f1_vz = self.eef_dot_array[2]
+                f2_vz = self.eef_dot_array[5]
+                f3_vz = self.eef_dot_array[8]
+                z_vel_raw = (f1_vz + f2_vz + f3_vz) / 3.0
+                self.z_vel_filt = 0.85 * self.z_vel_filt + 0.15 * z_vel_raw
+            else:
+                self.z_vel_filt = 0.0
+
+            # --- 3. 판 무게 보정 (2차 모델) ---
             roll_deg = np.degrees(self.target_data[3])
             pitch_deg = np.degrees(self.target_data[4])
 
@@ -214,6 +235,7 @@ class BallBalancingNode(Node):
             f2_exp = self.get_expected_force(roll_deg, pitch_deg, 1)
             f3_exp = self.get_expected_force(roll_deg, pitch_deg, 2)
 
+            # --- 4. 정적 보정만 적용한 잔차 (eef_force, 관성 보상 제거) ---
             self.curr_f1_res = self.curr_f1_raw - f1_exp
             self.curr_f2_res = self.curr_f2_raw - f2_exp
             self.curr_f3_res = self.curr_f3_raw - f3_exp
@@ -223,25 +245,26 @@ class BallBalancingNode(Node):
             if self.curr_f2_res < MIN_FORCE: self.curr_f2_res = MIN_FORCE
             if self.curr_f3_res < MIN_FORCE: self.curr_f3_res = MIN_FORCE
 
+            # --- 5. CoP → 공 위치 추정 (보상된 힘 사용) ---
             f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res
 
             avg_eef_x = (self.eef_array[0] + self.eef_array[2] + self.eef_array[4]) / 3.0
             avg_eef_y = (self.eef_array[1] + self.eef_array[3] + self.eef_array[5]) / 3.0
 
             if f_total <= 0.0:
-                bx = 0.0  
+                bx = 0.0
                 by = 0.0
             else:
-                cop_x = (self.eef_array[0] * self.curr_f1_res + 
-                         self.eef_array[2] * self.curr_f2_res + 
+                cop_x = (self.eef_array[0] * self.curr_f1_res +
+                         self.eef_array[2] * self.curr_f2_res +
                          self.eef_array[4] * self.curr_f3_res) / f_total
-                cop_y = (self.eef_array[1] * self.curr_f1_res + 
-                         self.eef_array[3] * self.curr_f2_res + 
+                cop_y = (self.eef_array[1] * self.curr_f1_res +
+                         self.eef_array[3] * self.curr_f2_res +
                          self.eef_array[5] * self.curr_f3_res) / f_total
-                
+
                 rel_x = cop_x - avg_eef_x
                 rel_y = cop_y - avg_eef_y
-                
+
                 if f_total < F_TOTAL_MIN:
                     alpha = f_total / F_TOTAL_MIN
                     bx = rel_x * alpha
@@ -250,11 +273,17 @@ class BallBalancingNode(Node):
                     bx = rel_x
                     by = rel_y
 
+            # --- 6. 공 상태 갱신 (이동평균 속도 필터) ---
             if f_total >= F_TOTAL_MIN:
                 self.ball_detected = True
                 raw_vx = (bx - self.curr_ball_x) / self.dt
                 raw_vy = (by - self.curr_ball_y) / self.dt
-                self.curr_ball_vx, self.curr_ball_vy = raw_vx, raw_vy
+
+                self.v_history[self.v_history_idx] = [raw_vx, raw_vy]
+                self.v_history_idx = (self.v_history_idx + 1) % 5
+                self.curr_ball_vx = np.mean(self.v_history[:, 0])
+                self.curr_ball_vy = np.mean(self.v_history[:, 1])
+
                 self.curr_ball_x = bx
                 self.curr_ball_y = by
                 self.prev_ball_detected = True
@@ -266,51 +295,38 @@ class BallBalancingNode(Node):
                 self.curr_ball_x = bx
                 self.curr_ball_y = by
 
+            # --- 7. PD 제어 + Z속도 기반 적응형 게인 ---
+            z_vel_mag = abs(self.z_vel_filt)
+            if z_vel_mag > 0.01:
+                gain_scale = max(0.15, 1.0 - z_vel_mag / 0.05)
+            else:
+                gain_scale = 1.0
+
+            Kp_active = self.Kp_ball * gain_scale
+            Kd_active = self.Kd_ball * gain_scale
+
             cmd_tilt = np.zeros(2)
-            if not self.is_paused:
+            if not self.is_paused and self.ball_detected:
                 err_x = self.target_ball_x - self.curr_ball_x
                 err_y = self.target_ball_y - self.curr_ball_y
-                
-                t1 = 0.2
-                t2 = 0.33 * t1
+                cmd_tilt[0] = Kp_active * err_x + Kd_active * (0.0 - self.curr_ball_vx)
+                cmd_tilt[1] = Kp_active * err_y + Kd_active * (0.0 - self.curr_ball_vy)
 
-                if self.state == 0:
-                    if err_x > 0.07:
-                        cmd_tilt[0] = np.radians(5); self.state = 1; self.state_wait = time.time() + t1
-                    elif err_x < -0.07:
-                        cmd_tilt[0] = -np.radians(5); self.state = 2; self.state_wait = time.time() + t1
-                    elif err_y > 0.07:
-                        cmd_tilt[1] = np.radians(5); self.state = 3; self.state_wait = time.time() + t1
-                    elif err_y < -0.07:
-                        cmd_tilt[1] = -np.radians(5); self.state = 4; self.state_wait = time.time() + t1
-                elif self.state == 1:
-                    cmd_tilt[0] = np.radians(15 * (self.state_wait - time.time() - t2) / t1)
-                    if time.time() > self.state_wait: self.state = -1
-                elif self.state == 2:
-                    cmd_tilt[0] = -np.radians(15 * (self.state_wait - time.time() - t2) / t1)
-                    if time.time() > self.state_wait: self.state = -1
-                elif self.state == 3:
-                    cmd_tilt[1] = np.radians(15 * (self.state_wait - time.time() - t2) / t1)
-                    if time.time() > self.state_wait: self.state = -1
-                elif self.state == 4:
-                    cmd_tilt[1] = -np.radians(15 * (self.state_wait - time.time() - t2) / t1)
-                    if time.time() > self.state_wait: self.state = -1
-                elif self.state == -1:
-                    if time.time() > self.state_wait + 1.5: self.state = 0
-
-                cmd_tilt = np.clip(cmd_tilt, -self.MAX_TILT_RAD, self.MAX_TILT_RAD)
+            cmd_tilt = np.clip(cmd_tilt, -self.MAX_TILT_RAD, self.MAX_TILT_RAD)
 
             self.target_data[0:3] = np.zeros(3)
-            self.target_data[3] = -cmd_tilt[1] + self.roll_offset_rad 
-            self.target_data[4] = cmd_tilt[0] + self.pitch_offset_rad 
+            self.target_data[3] = -cmd_tilt[1] + self.roll_offset_rad
+            self.target_data[4] = cmd_tilt[0] + self.pitch_offset_rad
             self.pose_array[:] = self.target_data[:]
 
+            # --- 8. CSV 로깅 ---
             self.csv_data.append([
                 now, self.target_data[3], self.target_data[4],
                 self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw,
                 self.curr_f1_res, self.curr_f2_res, self.curr_f3_res,
-                self.curr_ball_x, self.curr_ball_y, self.curr_ball_vx, self.curr_ball_vy
-            ] + eef_force_data)
+                self.curr_ball_x, self.curr_ball_y, self.curr_ball_vx, self.curr_ball_vy,
+                self.z_vel_filt, gain_scale
+            ])
 
         except Exception as e:
             self.get_logger().error(f"Error in control loop: {e}")
@@ -319,7 +335,8 @@ class BallBalancingNode(Node):
         if self.shm_ball: self.shm_ball.close()
         if self.shm_pose: self.shm_pose.close()
         if self.shm_eef: self.shm_eef.close()
-        if self.shm_eef_force: self.shm_eef_force.close() 
+        if self.shm_eef_force: self.shm_eef_force.close()
+        if self.shm_eef_dot: self.shm_eef_dot.close()
         cv2.destroyAllWindows()  # OpenCV 윈도우 파괴 추가
         super().destroy_node()
 
@@ -549,6 +566,10 @@ class TuningUI:
             self.lbl_c0_s3.config(text=f"Sensor 3 c0: {val:>7.3f}")
 
     def update_ui_loop(self):
+        if self.node.shutdown_flag:
+            self.root.quit()
+            return
+
         # 1. 기존 Tkinter 텍스트 필드 실시간 업데이트 로직
         if self.node.shm_connected_ball:
             self.lbl_curr_raw.config(text=f"Raw 1: {self.node.curr_f1_raw:>6.1f} | Raw 2: {self.node.curr_f2_raw:>6.1f} | Raw 3: {self.node.curr_f3_raw:>6.1f}")
@@ -563,7 +584,7 @@ class TuningUI:
                 self.lbl_ball_pos.config(text="Pos (X, Y):      - ,      -")
                 self.lbl_ball_vel.config(text="Vel (Vx, Vy):     - ,      -")
         
-        self.lbl_actual_freq.config(text=f"Actual Freq: {self.node.actual_freq:>5.1f} Hz\nState: {self.node.state}")
+        self.lbl_actual_freq.config(text=f"Actual Freq: {self.node.actual_freq:>5.1f} Hz | Z_vel: {self.node.z_vel_filt:>6.3f} m/s | Gain: {self.node.Kp_ball * (max(0.15, 1.0 - abs(self.node.z_vel_filt)/0.05) if abs(self.node.z_vel_filt) > 0.01 else 1.0):.3f}")
 
         if self.node.shm_connected_pose and self.node.eef_force_array is not None:
             self.lbl_eef_force.config(text=f"EEF Forces (gf) - F1: {self.node.eef_force_array[0]:>6.1f} | F2: {self.node.eef_force_array[1]:>6.1f} | F3: {self.node.eef_force_array[2]:>6.1f}")
@@ -620,8 +641,15 @@ class TuningUI:
             cv2.putText(canvas, "Lost", (pixel_bx + 10, pixel_by - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
 
         # OpenCV 프레임 렌더링 버퍼 밀어내기
-        cv2.imshow("Ball & EEF Position Map", canvas)
-        cv2.waitKey(1) # GUI 이벤트 대기 및 비동기 루프 큐 갱신 처리
+        try:
+            cv2.imshow("Ball & EEF Position Map", canvas)
+            cv2.waitKey(1)
+        except KeyboardInterrupt:
+            self.node.shutdown_flag = True
+            self.root.quit()
+            return
+        except Exception:
+            pass
 
         # 100ms 주기로 Tkinter UI 및 OpenCV 타일 맵 리프레시 틱 가동
         self.root.after(100, self.update_ui_loop)
@@ -647,11 +675,11 @@ def main(args=None):
                 with open(filename, 'w', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow([
-                        'timestamp', 'roll_rad', 'pitch_rad', 
-                        'f1_raw', 'f2_raw', 'f3_raw', 
+                        'timestamp', 'roll_rad', 'pitch_rad',
+                        'f1_raw', 'f2_raw', 'f3_raw',
                         'f1_res', 'f2_res', 'f3_res',
                         'ball_x', 'ball_y', 'ball_vx', 'ball_vy',
-                        'eef_force_1', 'eef_force_2', 'eef_force_3'
+                        'z_vel_filt', 'gain_scale'
                     ])
                     writer.writerows(node.csv_data)
                 print(f"\n[CSV 저장] '{filename}'에 데이터를 성공적으로 저장했습니다.")

@@ -46,7 +46,7 @@ public:
         munmap(cmd_ptr_, 12 * sizeof(double));
         if (pose_ptr_) munmap(pose_ptr_, 12 * sizeof(double));
         if (eef_ptr_) munmap(eef_ptr_, 6 * sizeof(double));
-        if (eef_dot_ptr_) munmap(eef_dot_ptr_, 3 * sizeof(double));
+        if (eef_dot_ptr_) munmap(eef_dot_ptr_, 9 * sizeof(double));
         if (eef_force_ptr_) munmap(eef_force_ptr_, 3 * sizeof(double)); // [신설] 메모리 해제
         
         shm_unlink("target_pose_shm");
@@ -162,12 +162,12 @@ private:
         ftruncate(fd_eef, 6 * sizeof(double));
         eef_ptr_ = (double*)mmap(0, 6 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef, 0);
 
-        // --- 3. EEF Dot SHM (S->B, 3차원 강제 생성) ---
+        // --- 3. EEF Dot SHM (S->B, 9차원: 3 fingers × XYZ velocity in global frame) ---
         shm_unlink("eef_dot_shm");
         int fd_eef_dot = shm_open("eef_dot_shm", O_CREAT | O_RDWR, 0666);
-        ftruncate(fd_eef_dot, 3 * sizeof(double));
-        eef_dot_ptr_ = (double*)mmap(0, 3 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef_dot, 0);
-        for (int i = 0; i < 3; ++i) eef_dot_ptr_[i] = 0.0;
+        ftruncate(fd_eef_dot, 9 * sizeof(double));
+        eef_dot_ptr_ = (double*)mmap(0, 9 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef_dot, 0);
+        for (int i = 0; i < 9; ++i) eef_dot_ptr_[i] = 0.0;
 
         // --- 4. EEF Force SHM [신설] (S->B, 3차원 강제 생성) ---
         shm_unlink("eef_force_shm");
@@ -283,9 +283,11 @@ private:
                     eef_ptr_[i * 2 + 1] = j_roll.dot(curr_pos_[i]);
                 }
 
-                // --- [신규 SHM 기록] S -> B (eef_dot_shm) ---
+                // --- [수정] eef_dot_shm: 각 손가락의 XYZ 속도(global frame) 기록 (S -> B) ---
                 if (eef_dot_ptr_ != nullptr) {
-                    eef_dot_ptr_[i] = k_rp.dot(eef_y);
+                    eef_dot_ptr_[i * 3 + 0] = curr_vel_[i].x();
+                    eef_dot_ptr_[i * 3 + 1] = curr_vel_[i].y();
+                    eef_dot_ptr_[i * 3 + 2] = curr_vel_[i].z();
                 }
 
                 Eigen::Vector3d evx = i_pitch.dot(curr_vel_[i] - vel_center) * i_pitch;

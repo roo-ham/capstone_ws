@@ -18,3 +18,11 @@ Thumbs.db
 
 # Environment
 .env
+
+# Colcon build
+build/
+install/
+log/
+
+# Claude
+.claude/
