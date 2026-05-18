@@ -1,0 +1,7 @@
+float64[] joint_positions     # Input: 12 joint angles
+float64[] task_force_1        # [Fx, Fy, Fz, Mx, My, Mz] for Finger 1
+float64[] task_force_2        # [Fx, Fy, Fz, Mx, My, Mz] for Finger 2
+float64[] task_force_3        # [Fx, Fy, Fz, Mx, My, Mz] for Finger 3
+---
+float64[] joint_torques       # Output: Total joint torques (Size 12)
+bool success

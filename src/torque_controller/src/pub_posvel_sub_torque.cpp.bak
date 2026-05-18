@@ -1,0 +1,257 @@
+#include <chrono>
+#include <memory>
+#include <vector>
+#include <string>
+#include <iostream>
+#include <cmath>
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+
+#include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
+#include "dynamixel_sdk/dynamixel_sdk.h"
+
+using namespace std::chrono_literals;
+
+// --- Control Table (XH/XM Series) ---
+#define ADDR_RETURN_DELAY_TIME      9
+#define ADDR_OPERATING_MODE         11
+#define ADDR_TORQUE_ENABLE          64
+#define ADDR_GOAL_CURRENT           102
+#define ADDR_GOAL_POSITION          116 // [추가] 목표 위치 주소
+#define ADDR_PRESENT_VELOCITY       128 
+#define ADDR_PRESENT_POSITION       132
+
+// Data Length
+#define LEN_TORQUE_ENABLE           1
+#define LEN_GOAL_CURRENT            2
+#define LEN_GOAL_POSITION           4   // [추가] 목표 위치 데이터 길이
+#define LEN_POS_VEL_READ            8
+#define LEN_PRESENT_VELOCITY        4
+#define LEN_PRESENT_POSITION        4
+
+// Values
+#define TORQUE_ENABLE               1
+#define TORQUE_DISABLE              0
+#define OP_MODE_CURRENT             0
+#define OP_MODE_POSITION            3   // 위치 제어 모드
+
+// Communication
+#define PROTOCOL_VERSION            2.0
+#define BAUDRATE                    4000000
+#define DEVICENAME                  "/dev/ttyUSB0"
+
+// Physics Constants
+const double KT_CONSTANT = 1.0; 
+const double CURRENT_UNIT_A = 0.00415123456; 
+const double VELOCITY_UNIT_RPM = 0.229;
+const double RPM_TO_RAD_SEC = 0.104719755;
+const double DEG_TO_DXL = 1.0 / 0.088; // 1도당 Dynamixel Position Unit
+
+class PubJointStateSubTorque : public rclcpp::Node
+{
+public:
+    PubJointStateSubTorque()
+    : Node("pub_joint_state_sub_torque"), torque_enabled_(false), new_cmd_received_(false)
+    {
+        pub_joint_state_ = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
+        sub_torque_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+            "hand_joint_torque", 10,
+            std::bind(&PubJointStateSubTorque::write_callback, this, std::placeholders::_1));
+
+        offsets_ = {
+            337.5, 180.0, 180.0, 180.0,
+            112.5, 180.0, 180.0, 180.0,
+            247.5, 180.0, 180.0, 180.0
+        };
+
+        joint_names_ = {
+            "F11", "F12", "F13", "F14",
+            "F21", "F22", "F23", "F24",
+            "F31", "F32", "F33", "F34"
+        };
+
+        latest_torque_cmd_.assign(12, 0.0);
+
+        if (!init_dynamixel()) {
+            RCLCPP_ERROR(this->get_logger(), "Dynamixel Init Failed!");
+            rclcpp::shutdown();
+            return;
+        }
+
+        timer_ = this->create_wall_timer(
+            1ms, std::bind(&PubJointStateSubTorque::timer_callback, this));
+
+        RCLCPP_INFO(this->get_logger(), "Node Started. IDs 1,5,9: Position Mode, Others: Current Mode");
+    }
+
+    virtual ~PubJointStateSubTorque()
+    {
+        set_torque_all(false);
+        portHandler_->closePort();
+        delete GroupFastSyncRead_;
+        delete groupSyncWriteCurrent_;
+        delete groupSyncWritePosition_; // [추가]
+        delete groupSyncWriteTorque_;
+    }
+
+private:
+    bool init_dynamixel()
+    {
+        portHandler_ = dynamixel::PortHandler::getPortHandler(DEVICENAME);
+        packetHandler_ = dynamixel::PacketHandler::getPacketHandler(PROTOCOL_VERSION);
+
+        if (!portHandler_->openPort()) return false;
+        if (!portHandler_->setBaudRate(BAUDRATE)) return false;
+
+        GroupFastSyncRead_ = new dynamixel::GroupFastSyncRead(
+            portHandler_, packetHandler_, ADDR_PRESENT_VELOCITY, LEN_POS_VEL_READ);
+        
+        groupSyncWriteCurrent_ = new dynamixel::GroupSyncWrite(
+            portHandler_, packetHandler_, ADDR_GOAL_CURRENT, LEN_GOAL_CURRENT);
+
+        groupSyncWritePosition_ = new dynamixel::GroupSyncWrite(
+            portHandler_, packetHandler_, ADDR_GOAL_POSITION, LEN_GOAL_POSITION);
+        
+        groupSyncWriteTorque_ = new dynamixel::GroupSyncWrite(
+            portHandler_, packetHandler_, ADDR_TORQUE_ENABLE, LEN_TORQUE_ENABLE);
+
+        uint8_t dxl_error = 0;
+        for (uint8_t id = 1; id <= 12; id++) {
+            if (packetHandler_->ping(portHandler_, id, nullptr, &dxl_error) != COMM_SUCCESS) continue;
+
+            target_ids_.push_back(id);
+            GroupFastSyncRead_->addParam(id);
+
+            packetHandler_->write1ByteTxRx(portHandler_, id, ADDR_RETURN_DELAY_TIME, 0, &dxl_error);
+            packetHandler_->write1ByteTxRx(portHandler_, id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE, &dxl_error);
+
+            // [핵심] ID 1, 5, 9는 Position Mode(3), 나머지는 Current Mode(0)
+            uint8_t mode = (id == 1 || id == 5 || id == 9) ? OP_MODE_POSITION : OP_MODE_CURRENT;
+            packetHandler_->write1ByteTxRx(portHandler_, id, ADDR_OPERATING_MODE, mode, &dxl_error);
+        }
+
+        return !target_ids_.empty();
+    }
+
+    void set_torque_all(bool enable)
+    {
+        groupSyncWriteTorque_->clearParam();
+        uint8_t data = enable ? TORQUE_ENABLE : TORQUE_DISABLE;
+        uint8_t param[1] = { data };
+
+        for (uint8_t id : target_ids_) groupSyncWriteTorque_->addParam(id, param);
+        if (groupSyncWriteTorque_->txPacket() == COMM_SUCCESS) torque_enabled_ = enable;
+        // 토크 켜기 전, Position Mode 모터들의 목표 위치 설정 (급격한 움직임 방지)
+        if (enable) {
+            groupSyncWritePosition_->clearParam();
+            // ID 1: -60도, ID 5: 0도, ID 9: 60도 (오프셋 적용)
+            std::vector<std::pair<uint8_t, double>> targets = {{1, -60.0}, {5, 60}, {9, 0.0}};
+            
+            for (auto& target : targets) {
+                uint8_t id = target.first;
+                double target_deg = target.second;
+                int32_t pos_raw = (int32_t)((target_deg + offsets_[id-1]) * DEG_TO_DXL);
+                
+                uint8_t param[4];
+                param[0] = DXL_LOBYTE(DXL_LOWORD(pos_raw));
+                param[1] = DXL_HIBYTE(DXL_LOWORD(pos_raw));
+                param[2] = DXL_LOBYTE(DXL_HIWORD(pos_raw));
+                param[3] = DXL_HIBYTE(DXL_HIWORD(pos_raw));
+                groupSyncWritePosition_->addParam(id, param);
+            }
+            groupSyncWritePosition_->txPacket();
+        }
+    }
+
+    void write_callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+    {
+        if (msg->data.size() != 12) return;
+        latest_torque_cmd_ = msg->data;
+        new_cmd_received_ = true;
+    }
+
+    void timer_callback()
+    {
+        // 1. READ (전체 모터 상태 읽기 - 동일 유지)
+        if (GroupFastSyncRead_->txRxPacket() == COMM_SUCCESS) {
+            auto joint_state_msg = sensor_msgs::msg::JointState();
+            joint_state_msg.header.stamp = this->now();
+
+            for (uint8_t id : target_ids_) {
+                double pos_rad = 0.0;
+                double vel_rad_s = 0.0;
+                
+                if (GroupFastSyncRead_->isAvailable(id, ADDR_PRESENT_VELOCITY, LEN_POS_VEL_READ)) {
+                    int32_t vel_raw = (int32_t)GroupFastSyncRead_->getData(id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY);
+                    int32_t pos_raw = (int32_t)GroupFastSyncRead_->getData(id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION);
+
+                    vel_rad_s = (vel_raw * VELOCITY_UNIT_RPM) * RPM_TO_RAD_SEC;
+                    double final_deg = (pos_raw * 0.088) - offsets_[id - 1]; 
+                    pos_rad = final_deg * (M_PI / 180.0);
+                }
+                joint_state_msg.name.push_back(joint_names_[id - 1]);
+                joint_state_msg.position.push_back(pos_rad);
+                joint_state_msg.velocity.push_back(vel_rad_s);
+            }
+            pub_joint_state_->publish(joint_state_msg);
+        }
+
+        // 2. WRITE (Current Mode 모터들만 토크 명령 전송)
+        if (new_cmd_received_) {
+            if (!torque_enabled_) set_torque_all(true);
+
+            groupSyncWriteCurrent_->clearParam();
+
+            for (uint8_t id : target_ids_) {
+                // [변경] ID 1, 5, 9는 토크 명령에서 제외 (위치 제어 모드이므로)
+                if (id == 1 || id == 5 || id == 9) continue;
+
+                double torque_nm = latest_torque_cmd_[id - 1]; 
+                double current_a = torque_nm / KT_CONSTANT;
+                int16_t goal_current_val = (int16_t)(current_a / CURRENT_UNIT_A);
+
+                int16_t limit = 600; 
+                if (goal_current_val > limit) goal_current_val = limit;
+                if (goal_current_val < -limit) goal_current_val = -limit;
+
+                uint8_t param[2];
+                param[0] = DXL_LOBYTE(goal_current_val);
+                param[1] = DXL_HIBYTE(goal_current_val);
+                groupSyncWriteCurrent_->addParam(id, param);
+            }
+            groupSyncWriteCurrent_->txPacket(); 
+        }
+    }
+
+    // Members
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_joint_state_;
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_torque_;
+    rclcpp::TimerBase::SharedPtr timer_;
+    
+    dynamixel::PortHandler *portHandler_;
+    dynamixel::PacketHandler *packetHandler_;
+    
+    dynamixel::GroupFastSyncRead *GroupFastSyncRead_;
+    dynamixel::GroupSyncWrite *groupSyncWriteCurrent_;
+    dynamixel::GroupSyncWrite *groupSyncWritePosition_; // [추가]
+    dynamixel::GroupSyncWrite *groupSyncWriteTorque_;
+
+    std::vector<uint8_t> target_ids_;
+    std::vector<double> offsets_;
+    std::vector<std::string> joint_names_;
+    std::vector<double> latest_torque_cmd_;
+    
+    bool torque_enabled_;
+    bool new_cmd_received_;
+};
+
+int main(int argc, char * argv[])
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<PubJointStateSubTorque>());
+    rclcpp::shutdown();
+    return 0;
+}

@@ -1,0 +1,78 @@
+{
+    "cameras": [
+        {
+            "b_slider": -4402.0,
+            "k_slider": 0.010461,
+            "rpicam_cmd": "rpicam-vid -t 0 --camera 1 --width 640 --height 400 --framerate 120 --codec yuv420 --denoise off --nopreview --awb custom --awbgains 1.5,1.5 --shutter 40000 --gain 7.0 -o - 2>/dev/null",
+            "source": "1",
+            "trap_src": [
+                [
+                    160,
+                    100
+                ],
+                [
+                    500,
+                    100
+                ],
+                [
+                    500,
+                    250
+                ],
+                [
+                    160,
+                    250
+                ]
+            ],
+            "zero_area": 0.0
+        },
+        {
+            "b_slider": -102.0,
+            "k_slider": 0.039,
+            "rpicam_cmd": "rpicam-vid -t 0 --camera 0 --width 640 --height 400 --framerate 120 --codec yuv420 --denoise off --nopreview --awb custom --awbgains 1.5,1.5 --shutter 50000 --gain 10.0 -o - 2>/dev/null",
+            "source": "0",
+            "trap_src": [
+                [
+                    160,
+                    100
+                ],
+                [
+                    500,
+                    100
+                ],
+                [
+                    500,
+                    200
+                ],
+                [
+                    160,
+                    200
+                ]
+            ],
+            "zero_area": 0.0
+        },
+        {
+            "b_slider": -121.0,
+            "k_slider": 0.016,
+            "source": "/dev/v4l/by-id/usb-Arducam_Technology_Co.__Ltd._Arducam_OV9281_USB_Camera_UC762-video-index0",
+            "trap_src": [
+                [
+                    160,
+                    150
+                ],
+                [
+                    480,
+                    150
+                ],
+                [
+                    360,
+                    400
+                ],
+                [
+                    250,
+                    400
+                ]
+            ],
+            "zero_area": 0.0
+        }
+    ]
+}

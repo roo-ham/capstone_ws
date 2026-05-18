@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/kimdonghwi/.ssh/**)",
+      "Bash(sudo apt-get update -qq)",
+      "Bash(sudo apt-get install -y -qq gh)",
+      "Bash(snap install *)",
+      "Read(//usr/local/bin/**)",
+      "Read(//snap/bin/**)",
+      "Read(//tmp/**)",
+      "Bash(curl -sL \"https://github.com/cli/cli/releases/download/v2.63.2/gh_2.63.2_linux_arm64.tar.gz\" -o gh.tar.gz)",
+      "Bash(tar -xzf gh.tar.gz)",
+      "Bash(mkdir -p ~/.local/bin)",
+      "Bash(cp gh_2.63.2_linux_arm64/bin/gh ~/.local/bin/gh)",
+      "Bash(export PATH=\"$HOME/.local/bin:$PATH\")",
+      "Bash(gh auth *)"
+    ]
+  }
+}

@@ -1,0 +1,422 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot name="hand_0926">
+   <link name="base_link">
+      <inertial>
+         <origin xyz="6.66104851059779E-05 -0.00146739183607125 0.0762177012368623" rpy="0 0 0" />
+         <mass value="0.655736341063627" />
+         <inertia ixx="0.000360662836084202" ixy="-1.36824004655417E-06" ixz="-1.32422040669197E-06" iyy="0.000313588606836419" iyz="7.21635100663965E-07" izz="0.000538550929013271" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/base_link.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.780392156862745 0.780392156862745 0.780392156862745 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/base_link.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <link name="FL31">
+      <inertial>
+         <origin xyz="-8.03778347993056E-05 0.00404564483954523 -0.0650036190426795" rpy="0 0 0" />
+         <mass value="0.0868189421596448" />
+         <inertia ixx="2.36691726427971E-05" ixy="-1.23676501687214E-08" ixz="-4.90817777022936E-09" iyy="2.05134886465965E-05" iyz="-4.79858201450662E-08" izz="1.41057488688804E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL31.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL31.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F31" type="revolute">
+      <origin xyz="0 -0.0335 0.068" rpy="3.1416 0 0" />
+      <parent link="base_link" />
+      <child link="FL31" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL32">
+      <inertial>
+         <origin xyz="0.000563304909810158 0.0299883292052074 -0.0655569469922324" rpy="0 0 0" />
+         <mass value="0.102701263719407" />
+         <inertia ixx="2.68833438278235E-05" ixy="-1.39405707718603E-07" ixz="6.39316608347209E-08" iyy="2.02977081699989E-05" iyz="1.9093010841103E-06" izz="2.97650268592665E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL32.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL32.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F32" type="revolute">
+      <origin xyz="0 -0.0144999999999999 -0.07825" rpy="-1.5707963267949 0 3.14159265358979" />
+      <parent link="FL31" />
+      <child link="FL32" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL33">
+      <inertial>
+         <origin xyz="0.000819888136350824 0.0424082341753711 -0.0183629597645804" rpy="0 0 0" />
+         <mass value="0.106089920358158" />
+         <inertia ixx="3.27169850742848E-05" ixy="-4.30558776102677E-07" ixz="7.71033289124017E-10" iyy="2.19747313468722E-05" iyz="-3.57573454333983E-07" izz="2.65058210046359E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL33.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL33.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F33" type="revolute">
+      <origin xyz="0.019 0.0472528145538523 -0.068249999999995" rpy="0 1.5707963267949 0" />
+      <parent link="FL32" />
+      <child link="FL33" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL34">
+      <inertial>
+         <origin xyz="0.000428374477744853 0.0392529713971393 -0.0193483262303518" rpy="0 0 0" />
+         <mass value="0.0205316674082003" />
+         <inertia ixx="5.02898129716074E-06" ixy="-1.26329247258682E-07" ixz="-1.05641709954605E-08" iyy="3.14897196065651E-06" iyz="-1.28291889757303E-07" izz="4.01492369920501E-06" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL34.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.698039215686274 0.698039215686274 0.698039215686274 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL34.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F34" type="revolute">
+      <origin xyz="0 0.0591249999999997 0" rpy="0 0 0" />
+      <parent link="FL33" />
+      <child link="FL34" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL21">
+      <inertial>
+         <origin xyz="-8.03778346082917E-05 0.00404564484421988 -0.065003619021223" rpy="0 0 0" />
+         <mass value="0.0868189421992847" />
+         <inertia ixx="2.36691726423632E-05" ixy="-1.23676505078363E-08" ixz="-4.90817769421218E-09" iyy="2.05134886424122E-05" iyz="-4.79858213004414E-08" izz="1.41057488672063E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL21.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL21.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F21" type="revolute">
+      <origin xyz="0.029012 0.01675 0.068" rpy="3.1416 0 -3.1416" />
+      <parent link="base_link" />
+      <child link="FL21" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL22">
+      <inertial>
+         <origin xyz="0.000563306231886385 0.0299883337175537 -0.0655569477729367" rpy="0 0 0" />
+         <mass value="0.102701244218747" />
+         <inertia ixx="2.68833395015692E-05" ixy="-1.39403134774111E-07" ixz="6.39303974847197E-08" iyy="2.02977028321604E-05" iyz="1.90929889220112E-06" izz="2.97650199985316E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL22.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL22.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F22" type="revolute">
+      <origin xyz="0 -0.0145000000000001 -0.0782499999999998" rpy="-1.5707963267949 0 -3.14159265358979" />
+      <parent link="FL21" />
+      <child link="FL22" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL23">
+      <inertial>
+         <origin xyz="0.000819885984481405 0.0424082290895106 -0.0183629630872281" rpy="0 0 0" />
+         <mass value="0.106089936756497" />
+         <inertia ixx="3.27166582676907E-05" ixy="-4.30474288687722E-07" ixz="7.67485060530412E-10" iyy="2.19747160208104E-05" iyz="-3.57576241585855E-07" izz="2.65054704067411E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL23.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL23.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F23" type="revolute">
+      <origin xyz="0.0190000000000001 0.0472528145538521 -0.0682499999999999" rpy="0 1.5707963267949 0" />
+      <parent link="FL22" />
+      <child link="FL23" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL24">
+      <inertial>
+         <origin xyz="0.000428374442371871 0.0392530671984008 -0.019348323333427" rpy="0 0 0" />
+         <mass value="0.020531742397098" />
+         <inertia ixx="5.0289976371824E-06" ixy="-1.26322373135634E-07" ixz="-1.05602849179601E-08" iyy="3.14897774175065E-06" iyz="-1.28293086350955E-07" izz="4.01493737983713E-06" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL24.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.698039215686274 0.698039215686274 0.698039215686274 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL24.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F24" type="revolute">
+      <origin xyz="0 0.0591249999999999 0" rpy="0 0 0" />
+      <parent link="FL23" />
+      <child link="FL24" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL11">
+      <inertial>
+         <origin xyz="-8.03778346082917E-05 0.00404564484421999 -0.0650036190212232" rpy="0 0 0" />
+         <mass value="0.0868189421992846" />
+         <inertia ixx="2.36691726423632E-05" ixy="-1.23676505078681E-08" ixz="-4.90817769425728E-09" iyy="2.05134886424121E-05" iyz="-4.79858213004417E-08" izz="1.41057488672063E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL11.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL11.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F11" type="revolute">
+      <origin xyz="-0.0290118510267787 0.0167499999999996 0.068" rpy="-3.14159265358979 0 -3.14159265358979" />
+      <parent link="base_link" />
+      <child link="FL11" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL12">
+      <inertial>
+         <origin xyz="0.00056330622791767 0.0299883337283617 -0.0655569477767348" rpy="0 0 0" />
+         <mass value="0.102701244185666" />
+         <inertia ixx="2.68833394937803E-05" ixy="-1.39403140142511E-07" ixz="6.39304011943712E-08" iyy="2.02977028241437E-05" iyz="1.90929888853156E-06" izz="2.97650199878025E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL12.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL12.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F12" type="revolute">
+      <origin xyz="0 -0.0145 -0.0782499999999976" rpy="-1.57079632679489 0 3.14159265358979" />
+      <parent link="FL11" />
+      <child link="FL12" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL13">
+      <inertial>
+         <origin xyz="0.00081988598331767 0.0424082290849416 -0.018362963087229" rpy="0 0 0" />
+         <mass value="0.106089936756486" />
+         <inertia ixx="3.27169840816174E-05" ixy="-4.3055696436025E-07" ixz="7.67486639775062E-10" iyy="2.1974736999916E-05" iyz="-3.57576235198874E-07" izz="2.65058171998073E-05" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL13.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.250980392156863 0.250980392156863 0.250980392156863 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL13.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F13" type="revolute">
+      <origin xyz="0.0190000000000011 0.0472528145538534 -0.0682499999999997" rpy="0 1.5707963267949 0" />
+      <parent link="FL12" />
+      <child link="FL13" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+   <link name="FL14">
+      <inertial>
+         <origin xyz="0.000428374441906409 0.0392530672037423 -0.0193483233305055" rpy="0 0 0" />
+         <mass value="0.0205317424023075" />
+         <inertia ixx="5.02899763817442E-06" ixy="-1.26322372974566E-07" ixz="-1.05602846945543E-08" iyy="3.14897774240472E-06" iyz="-1.28293086776836E-07" izz="4.01493738003975E-06" />
+      </inertial>
+      <visual>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL14.STL" />
+         </geometry>
+         <material name="">
+            <color rgba="0.698039215686274 0.698039215686274 0.698039215686274 1" />
+         </material>
+      </visual>
+      <collision>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <geometry>
+            <mesh filename="package://torque_controller/urdf/meshes/FL14.STL" />
+         </geometry>
+      </collision>
+   </link>
+   <joint name="F14" type="revolute">
+      <origin xyz="0 0.0591250000000006 0" rpy="0 0 0" />
+      <parent link="FL13" />
+      <child link="FL14" />
+      <axis xyz="0 0 1" />
+      <limit lower="-3.14" upper="3.14" effort="40" velocity="10" />
+   </joint>
+
+   <link name="FL1EEF">
+      <inertial>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <mass value="0.01" />
+         <inertia ixx="1.0E-07" ixy="1.0E-07" ixz="1.0E-07"
+                  iyx="1.0E-07" iyy="1.0E-07" iyz="1.0E-07"
+                  izx="1.0E-07" izy="1.0E-07" izz="1.0E-07"/>
+      </inertial>
+   </link>
+   <joint name="F1EEF" type="fixed">
+      <origin xyz="-0.007 0.065 -0.02" rpy="0 0 0.785398" />
+      <parent link="FL14" />
+      <child link="FL1EEF" />
+   </joint>
+
+   <link name="FL2EEF">
+      <inertial>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <mass value="0.01" />
+         <inertia ixx="1.0E-07" ixy="1.0E-07" ixz="1.0E-07"
+                  iyx="1.0E-07" iyy="1.0E-07" iyz="1.0E-07"
+                  izx="1.0E-07" izy="1.0E-07" izz="1.0E-07"/>
+      </inertial>
+   </link>
+   <joint name="F2EEF" type="fixed">
+      <origin xyz="-0.007 0.065 -0.02" rpy="0 0 0.785398" />
+      <parent link="FL24" />
+      <child link="FL2EEF" />
+   </joint>
+
+   <link name="FL3EEF">
+      <inertial>
+         <origin xyz="0 0 0" rpy="0 0 0" />
+         <mass value="0.01" />
+         <inertia ixx="1.0E-07" ixy="1.0E-07" ixz="1.0E-07"
+                  iyx="1.0E-07" iyy="1.0E-07" iyz="1.0E-07"
+                  izx="1.0E-07" izy="1.0E-07" izz="1.0E-07"/>
+      </inertial>
+   </link>
+   <joint name="F3EEF" type="fixed">
+      <!-- 0.785398  = 45 degree -->
+      <origin xyz="-0.007 0.065 -0.02" rpy="0 0 0.82" />
+      <parent link="FL34" />
+      <child link="FL3EEF" />
+   </joint>
+</robot>

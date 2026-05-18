@@ -1,0 +1,6 @@
+float64[] joint_positions        # Input: 12 joint angles
+---
+geometry_msgs/Pose tip_1_position         # Output: [x, y, z] for Finger 1 (FL14)
+geometry_msgs/Pose tip_2_position         # Output: [x, y, z] for Finger 2 (FL24)
+geometry_msgs/Pose tip_3_position         # Output: [x, y, z] for Finger 3 (FL34)
+bool success

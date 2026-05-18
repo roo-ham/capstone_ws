@@ -1,0 +1,555 @@
+#!/usr/bin/python3
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Empty
+import numpy as np
+from multiprocessing import shared_memory
+import threading
+import tkinter as tk
+from tkinter import ttk
+import time
+import os
+import json
+import csv
+
+F_TOTAL_MIN = 30
+
+class BallBalancingNode(Node):
+    def __init__(self):
+        super().__init__('ball_balancing_node')
+
+        self.dt = 0.002
+        self.control_timer = self.create_timer(self.dt, self.control_loop)
+
+        self.loop_count = 0
+        self.last_freq_time = time.time()
+        self.actual_freq = 0.0
+
+        # SHM 변수
+        self.shm_ball = None
+        self.ball_state_array = None
+        self.shm_pose = None
+        self.pose_array = None
+        self.shm_eef = None
+        self.eef_array = None
+        self.shm_eef_force = None 
+        self.eef_force_array = None 
+        
+        self.shm_connected_ball = False
+        self.shm_connected_pose = False
+
+        # 플래그 및 모드
+        self.is_paused = False
+        self.ball_detected = False
+        self.prev_ball_detected = False
+
+        # 포스 데이터 변수
+        self.curr_f1_raw = 0.0; self.curr_f2_raw = 0.0; self.curr_f3_raw = 0.0
+        self.curr_f1_res = 0.0; self.curr_f2_res = 0.0; self.curr_f3_res = 0.0
+
+        # 판 무게 하중 보정 2차 함수 계수
+        self.force_coeffs = np.array([
+            [247.2043,  -4.0341,  -4.5639,  -0.1540,  -0.2591,  -0.1475],  # Sensor 1 (c0, c1, c2, c3, c4, c5)
+            [156.4777,  -2.8153,  -5.5666,   0.1469,   0.0259,   0.6568],  # Sensor 2 (c0, c1, c2, c3, c4, c5)
+            [90.4393,  -7.3359,  -5.3972,   0.1569,   0.0036,   0.3956]   # Sensor 3 (c0, c1, c2, c3, c4, c5)
+        ])
+        
+        # 공 위치 추정 2차 다항식 계수
+        self.poly_coeffs_x = np.array([
+            -0.018512, -0.002182, -0.000442, -0.001920, -0.000000, 
+            -0.000014,  0.000032,  0.000002,  0.000000,  0.000019
+        ])
+        self.poly_coeffs_y = np.array([
+            -0.060019, -0.000129, -0.000021, -0.009140,  0.000002, 
+            -0.000008, -0.000069,  0.000005,  0.000010, -0.000009
+        ])
+        
+        # 공 상태 변수
+        self.curr_ball_x = 0.0; self.curr_ball_y = 0.0
+        self.curr_ball_vx = 0.0; self.curr_ball_vy = 0.0
+        self.target_ball_x = 0.0; self.target_ball_y = 0.0
+        self.target_ball_vx = 0.0; self.target_ball_vy = 0.0
+
+        # 속도 MA 필터 버퍼 (2차원[vx, vy])
+        self.v_history = np.zeros((5, 2))
+
+        # 기본 게인 초기화
+        self.Kp_ball = 1.0
+        self.Kd_ball = 0.1
+
+        self.csv_data = [] 
+        self.target_data = np.zeros(12)
+        self.f_xyz_manual = np.zeros(3, np.float64)
+
+        self.config_file = 'balance_config.json'
+        
+        # 노드 시작 시 1회 로드
+        self.load_config()
+
+        self.zero_pub = self.create_publisher(Empty, 'set_force_zero', 10)
+        self.get_logger().info("Ball Balancing Node (MA + Hysteresis Filter) Starting...")
+
+        self.pause_control()
+
+    def get_expected_force(self, roll_deg, pitch_deg, sensor_idx):
+        c = self.force_coeffs[sensor_idx]
+        x = roll_deg; y = pitch_deg
+        return c[0] + c[1]*x + c[2]*y + c[3]*(x**2) + c[4]*(y**2) + c[5]*(x*y)
+
+    def calc_poly_position(self, f1, f2, f3, coeffs):
+        c = coeffs
+        return (c[0] + 
+                c[1]*f1 + c[2]*f2 + c[3]*f3 + 
+                c[4]*(f1**2) + c[5]*(f2**2) + c[6]*(f3**2) + 
+                c[7]*f1*f2 + c[8]*f2*f3 + c[9]*f1*f3)
+
+    def load_config(self):
+        self.max_tilt_deg = 8.0
+        self.MAX_TILT_RAD = np.radians(self.max_tilt_deg)
+        self.roll_offset_rad = 0.0
+        self.pitch_offset_rad = 0.0
+        
+        target_defaults = [0.0, 0.0, 0.0, 0.0, 0.0, 200.0, 10.0, 1.0, 0.2, 0.2, 50.0, 5.0]
+        self.target_data[:] = target_defaults
+
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    cfg = json.load(f)
+                    self.max_tilt_deg = cfg.get('max_tilt_deg', self.max_tilt_deg)
+                    self.MAX_TILT_RAD = np.radians(self.max_tilt_deg)
+                    self.roll_offset_rad = cfg.get('roll_offset_rad', self.roll_offset_rad)
+                    self.pitch_offset_rad = cfg.get('pitch_offset_rad', self.pitch_offset_rad)
+                    
+                    self.Kp_ball = cfg.get('Kp_ball', self.Kp_ball)
+                    self.Kd_ball = cfg.get('Kd_ball', self.Kd_ball)
+
+                    for i in range(5, 12):
+                        idx_str = str(i)
+                        if idx_str in cfg.get('target_data', {}):
+                            self.target_data[i] = cfg['target_data'][idx_str]
+                self.get_logger().info("Configuration loaded successfully.")
+        except Exception as e:
+            self.get_logger().error(f"Failed to load config: {e}")
+
+    def save_config(self):
+        cfg = {
+            'max_tilt_deg': self.max_tilt_deg,
+            'roll_offset_rad': self.roll_offset_rad,
+            'pitch_offset_rad': self.pitch_offset_rad,
+            'Kp_ball': self.Kp_ball,
+            'Kd_ball': self.Kd_ball,
+            'target_data': {str(i): self.target_data[i] for i in range(5, 12)}
+        }
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(cfg, f, indent=4)
+            self.get_logger().info("Configuration saved successfully.")
+        except Exception as e:
+            self.get_logger().error(f"Failed to save config: {e}")
+
+    def set_force_zero(self):
+        self.zero_pub.publish(Empty())
+
+    def pause_control(self):
+        self.is_paused = True
+
+    def resume_control(self):
+        self.is_paused = False
+
+    def connect_shared_memory(self):
+        if not self.shm_connected_ball:
+            try:
+                if self.shm_ball is None:
+                    self.shm_ball = shared_memory.SharedMemory(name='ball_state_shm')
+                    self.ball_state_array = np.ndarray((4,), dtype=np.float64, buffer=self.shm_ball.buf)
+                self.shm_connected_ball = True
+            except FileNotFoundError:
+                pass
+
+        if not self.shm_connected_pose:
+            if os.path.exists('/dev/shm/target_pose_shm') and os.path.exists('/dev/shm/eef_pos_shm') and os.path.exists('/dev/shm/eef_force_shm'):
+                self.shm_pose = shared_memory.SharedMemory(name='target_pose_shm', create=False)
+                self.pose_array = np.ndarray((12,), dtype=np.float64, buffer=self.shm_pose.buf)
+                
+                self.shm_eef = shared_memory.SharedMemory(name='eef_pos_shm', create=False)
+                self.eef_array = np.ndarray((6,), dtype=np.float64, buffer=self.shm_eef.buf)
+                
+                self.shm_eef_force = shared_memory.SharedMemory(name='eef_force_shm', create=False)
+                self.eef_force_array = np.ndarray((3,), dtype=np.float64, buffer=self.shm_eef_force.buf)
+                
+                from multiprocessing.resource_tracker import unregister
+                unregister(self.shm_pose._name, 'shared_memory')
+                unregister(self.shm_eef._name, 'shared_memory')
+                unregister(self.shm_eef_force._name, 'shared_memory') # [수정] 주석 문법 오류(// -> #) 수정
+                
+                self.pose_array[:] = self.target_data[:]
+                self.shm_connected_pose = True
+
+    def control_loop(self):
+        if self.shm_connected_pose and (not os.path.exists('/dev/shm/target_pose_shm') or not os.path.exists('/dev/shm/eef_pos_shm') or not os.path.exists('/dev/shm/eef_force_shm')):
+            os._exit(0)
+
+        self.loop_count += 1
+        now = time.time()
+        if now - self.last_freq_time >= 1.0:
+            self.actual_freq = self.loop_count / (now - self.last_freq_time)
+            self.loop_count = 0
+            self.last_freq_time = now
+
+        self.connect_shared_memory()
+        if not self.shm_connected_ball or not self.shm_connected_pose:
+            return
+
+        try:
+            # [수정] 실시간 EEF 힘 데이터(3자유도) 추출 및 CSV 버퍼에 추가
+            eef_force_data = list(self.eef_force_array) if (self.shm_connected_pose and self.eef_force_array is not None) else [0.0]*3
+
+            curr_raw = np.array(self.ball_state_array)
+            self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw, _ = curr_raw - eef_force_data[0]
+
+            roll_deg = np.degrees(self.target_data[3])
+            pitch_deg = np.degrees(self.target_data[4])
+
+            f1_exp = self.get_expected_force(roll_deg, pitch_deg, 0)
+            f2_exp = self.get_expected_force(roll_deg, pitch_deg, 1)
+            f3_exp = self.get_expected_force(roll_deg, pitch_deg, 2)
+
+            # eef 에서 걸리는 힘 (J^-T * tau) 보상
+            self.curr_f1_res = self.curr_f1_raw - f1_exp
+            self.curr_f2_res = self.curr_f2_raw - f2_exp
+            self.curr_f3_res = self.curr_f3_raw - f3_exp
+
+            f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res
+            curr_v = np.zeros(2)
+            prev_v = np.zeros(2)
+
+            if f_total >= F_TOTAL_MIN:
+                self.ball_detected = True
+                
+                bx = self.calc_poly_position(self.curr_f1_res, self.curr_f2_res, self.curr_f3_res, self.poly_coeffs_x)
+                by = self.calc_poly_position(self.curr_f1_res, self.curr_f2_res, self.curr_f3_res, self.poly_coeffs_y)
+                
+                avg_eef_x = (self.eef_array[0] + self.eef_array[2] + self.eef_array[4]) / 3.0
+                avg_eef_y = (self.eef_array[1] + self.eef_array[3] + self.eef_array[5]) / 3.0
+                bx -= avg_eef_x
+                by -= avg_eef_y
+                
+                raw_vx = (bx - self.curr_ball_x) / self.dt
+                raw_vy = (by - self.curr_ball_y) / self.dt
+                raw_v = np.array([raw_vx, raw_vy])
+
+                MAX_V = 0.3
+                
+                if not self.prev_ball_detected:
+                    curr_v[:] = np.clip(raw_v, -MAX_V, MAX_V)
+                    self.v_history[:] = 0
+                    prev_v[:] = curr_v
+                else:
+                    margin = 0.5
+                    filtered_v = raw_v - np.clip(raw_v - prev_v, -margin, margin)
+                    prev_v[:] = filtered_v
+                    
+                    self.v_history = np.roll(self.v_history, -1, axis=0)
+                    # self.v_history[-1] = np.clip(filtered_v, -MAX_V, MAX_V)
+                    self.v_history[-1] = filtered_v
+
+                    curr_v = np.mean(self.v_history, axis=0)
+
+                self.curr_ball_vx, self.curr_ball_vy = curr_v
+                self.curr_ball_x = bx
+                self.curr_ball_y = by
+                self.prev_ball_detected = True
+            else:
+                self.ball_detected = False
+                self.prev_ball_detected = False
+                self.curr_ball_vx = 0.0
+                self.curr_ball_vy = 0.0
+
+            cmd_tilt = np.zeros(2)
+            if not self.is_paused and self.ball_detected:
+                err_x = self.target_ball_x - self.curr_ball_x
+                err_vx = self.target_ball_vx - self.curr_ball_vx
+                
+                err_y = self.target_ball_y - self.curr_ball_y
+                err_vy = self.target_ball_vy - self.curr_ball_vy
+                
+                cmd_tilt[0] = self.Kp_ball * err_x + self.Kd_ball * err_vx 
+                cmd_tilt[1] = self.Kp_ball * err_y + self.Kd_ball * err_vy 
+                
+                cmd_tilt = np.clip(cmd_tilt, -self.MAX_TILT_RAD, self.MAX_TILT_RAD)
+
+            self.target_data[0:3] = np.zeros(3)
+            self.target_data[3] = -cmd_tilt[1] + self.roll_offset_rad 
+            self.target_data[4] = cmd_tilt[0] + self.pitch_offset_rad 
+            self.pose_array[:] = self.target_data[:]
+
+            self.csv_data.append([
+                now, self.target_data[3], self.target_data[4],
+                self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw,
+                self.curr_f1_res, self.curr_f2_res, self.curr_f3_res,
+                self.curr_ball_x, self.curr_ball_y, self.curr_ball_vx, self.curr_ball_vy
+            ] + eef_force_data)
+
+        except Exception as e:
+            self.get_logger().error(f"Error in control loop: {e}")
+
+    def destroy_node(self):
+        if self.shm_ball: self.shm_ball.close()
+        if self.shm_pose: self.shm_pose.close()
+        if self.shm_eef: self.shm_eef.close()
+        if self.shm_eef_force: self.shm_eef_force.close() 
+        super().destroy_node()
+
+class TuningUI:
+    def __init__(self, node):
+        self.node = node
+        self.root = tk.Tk()
+        self.root.title("Ball Balancing PD Controller (MA + Hysteresis)")
+        self.root.geometry("1100x650") 
+        self.root.resizable(False, False) # 윈도우 크기 조절 자체를 방지
+
+        style = ttk.Style()
+        style.configure("TLabel", font=("Arial", 10))
+        style.configure("Header.TLabel", font=("Arial", 11, "bold"))
+        
+        # --- 고정폭(Monospace) 폰트 스타일 추가 (데이터 출력용) ---
+        style.configure("Data.TLabel", font=("Consolas", 10))
+        style.configure("DataHeader.TLabel", font=("Consolas", 11, "bold"))
+        
+        # 좌우 컬럼 프레임 너비 고정 (width 지정 및 pack_propagate(False) 적용)
+        left_col = ttk.Frame(self.root, padding=5, width=530)
+        left_col.pack(side='left', fill='both', expand=False, padx=5)
+        left_col.pack_propagate(False) 
+
+        right_col = ttk.Frame(self.root, padding=5, width=530)
+        right_col.pack(side='right', fill='both', expand=False, padx=5)
+        right_col.pack_propagate(False)
+        
+        # --- [Left] 실시간 모니터링 모듈 ---
+        state_frame = ttk.LabelFrame(left_col, text=" Status Monitor ", padding=5)
+        state_frame.pack(fill='x', pady=2)
+        
+        # width 속성을 부여하여 텍스트 길이에 관계없이 고정된 영역 확보
+        self.lbl_curr_raw = ttk.Label(state_frame, text="Raw Forces", style="DataHeader.TLabel", width=65)
+        self.lbl_curr_raw.pack(anchor='w', pady=2)
+        self.lbl_curr_res = ttk.Label(state_frame, text="Residues", style="DataHeader.TLabel", foreground="blue", width=65)
+        self.lbl_curr_res.pack(anchor='w', pady=2)
+        
+        ttk.Separator(state_frame, orient='horizontal').pack(fill='x', pady=5)
+        
+        self.lbl_ball_status = ttk.Label(state_frame, text="Ball: NOT DETECTED", style="DataHeader.TLabel", foreground="red", width=45)
+        self.lbl_ball_status.pack(anchor='w', pady=2)
+        self.lbl_ball_pos = ttk.Label(state_frame, text="Pos (X, Y):      - ,      -", style="Data.TLabel", width=45)
+        self.lbl_ball_pos.pack(anchor='w', pady=2)
+        self.lbl_ball_vel = ttk.Label(state_frame, text="Vel (Vx, Vy):     - ,      -", style="Data.TLabel", width=45)
+        self.lbl_ball_vel.pack(anchor='w', pady=2)
+
+        self.lbl_actual_freq = ttk.Label(state_frame, text="Actual Freq: 0.0 Hz", style="DataHeader.TLabel", foreground="green", width=25)
+        self.lbl_actual_freq.pack(anchor='w', pady=(10, 0))
+
+        # EEF 힘 출력 라벨 (고정폭 적용)
+        self.lbl_eef_force = ttk.Label(state_frame, text="EEF Forces (gf) - F1:   0.0 | F2:   0.0 | F3:   0.0", style="DataHeader.TLabel", foreground="purple", width=65)
+        self.lbl_eef_force.pack(anchor='w', pady=2)
+
+        # --- [Left] 독립형 볼 제어 파라미터 (PD) ---
+        pd_frame = ttk.LabelFrame(left_col, text=" Ball Controller (PD) ", padding=5)
+        pd_frame.pack(fill='x', pady=5)
+
+        self.lbl_kp_ball = ttk.Label(pd_frame, text=f"Kp_ball: {self.node.Kp_ball:.3f}", width=20)
+        self.lbl_kp_ball.pack(anchor='w')
+        self.sl_kp_ball = ttk.Scale(pd_frame, from_=0.0, to=5.0, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
+        self.sl_kp_ball.set(self.node.Kp_ball)
+        self.sl_kp_ball.pack(fill='x', expand=True, pady=(0,5))
+
+        self.lbl_kd_ball = ttk.Label(pd_frame, text=f"Kd_ball: {self.node.Kd_ball:.3f}", width=20)
+        self.lbl_kd_ball.pack(anchor='w')
+        self.sl_kd_ball = ttk.Scale(pd_frame, from_=0.0, to=1.0, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
+        self.sl_kd_ball.set(self.node.Kd_ball)
+        self.sl_kd_ball.pack(fill='x', expand=True)
+
+        # --- [Left] 제어 각도 한계 제어 ---
+        limit_frame = ttk.LabelFrame(left_col, text=" Control Limits ", padding=5)
+        limit_frame.pack(fill='x', pady=5)
+
+        self.lbl_max_tilt = ttk.Label(limit_frame, text=f"Max Tilt Angle: {self.node.max_tilt_deg:.1f} deg", width=30)
+        self.lbl_max_tilt.pack(anchor='w')
+        self.sl_max_tilt = ttk.Scale(limit_frame, from_=1.0, to=15.0, orient='horizontal', command=self.update_max_tilt)
+        self.sl_max_tilt.set(self.node.max_tilt_deg)
+        self.sl_max_tilt.pack(fill='x', expand=True)
+
+        # --- [Right] Config Management (Save/Load) ---
+        config_frame = ttk.LabelFrame(right_col, text=" Config Management ", padding=5)
+        config_frame.pack(fill='x', pady=2)
+        
+        btn_load = ttk.Button(config_frame, text="Load Config", command=self.action_load_config)
+        btn_load.pack(side='left', expand=True, padx=2)
+        btn_save = ttk.Button(config_frame, text="Save Config", command=self.action_save_config)
+        btn_save.pack(side='right', expand=True, padx=2)
+
+        # --- [Right] 로봇 핸드 및 시스템 하드웨어 파라미터 ---
+        gain_frame = ttk.LabelFrame(right_col, text=" Hardware Parameters ", padding=5)
+        gain_frame.pack(fill='x', pady=2)
+
+        self.gain_labels = {}
+        self.hw_sliders = {}
+        self.gains_def_list = [
+            ("Kp (K_task - Position)", 5, 200.0), 
+            ("Kp (K_task - Force)", 11, 5.0), 
+            ("Kd (D_task - Velocity)", 6, 10.0), 
+            ("Kp_rot (K_ori - Orientation)", 7, 1.0),
+            ("Friction Static", 8, 0.2),         
+            ("Friction Bias", 9, 0.2),           
+            ("Friction Vel Compensate", 10, 50.0) 
+        ]
+        for name, idx, max_val in self.gains_def_list:
+            frame = ttk.Frame(gain_frame)
+            frame.pack(fill='x', pady=1)
+            # 하드웨어 파라미터 라벨도 고정 문자 길이를 유지하도록 포맷 수정 예정
+            lbl = ttk.Label(frame, text=f"{name}: {self.node.target_data[idx]:>7.3f}", style="Data.TLabel", width=45)
+            lbl.pack(side='top', anchor='w')
+            self.gain_labels[name] = lbl
+            slider = ttk.Scale(frame, from_=0.0, to=max_val, orient='horizontal', command=lambda val, i=idx, n=name: self.update_hw_gain(i, val, n))
+            slider.set(self.node.target_data[idx])
+            slider.pack(fill='x', expand=True)
+            self.hw_sliders[name] = slider
+
+        # --- [Right] 수동 매뉴얼 오프셋 제어기 ---
+        offset_frame = ttk.LabelFrame(right_col, text=" Manual Roll/Pitch Offsets ", padding=5)
+        offset_frame.pack(fill='x', pady=5)
+
+        self.lbl_roll_offset = ttk.Label(offset_frame, text=f"Roll Offset: {np.degrees(self.node.roll_offset_rad):>7.3f}", style="Data.TLabel", width=25)
+        self.lbl_roll_offset.pack(anchor='w')
+        self.slider_roll_offset = ttk.Scale(offset_frame, from_=-10.0, to=10.0, orient='horizontal', command=lambda val: self.update_offset_value("roll", val))
+        self.slider_roll_offset.set(np.degrees(self.node.roll_offset_rad))
+        self.slider_roll_offset.pack(fill='x')
+
+        self.lbl_pitch_offset = ttk.Label(offset_frame, text=f"Pitch Offset: {np.degrees(self.node.pitch_offset_rad):>7.3f}", style="Data.TLabel", width=25)
+        self.lbl_pitch_offset.pack(anchor='w')
+        self.slider_pitch_offset = ttk.Scale(offset_frame, from_=-10.0, to=10.0, orient='horizontal', command=lambda val: self.update_offset_value("pitch", val))
+        self.slider_pitch_offset.set(np.degrees(self.node.pitch_offset_rad))
+        self.slider_pitch_offset.pack(fill='x')
+
+        # --- [Right] 노드 상태 및 기능 버튼 ---
+        ctrl_btn_frame = ttk.Frame(right_col)
+        ctrl_btn_frame.pack(fill='x', pady=5)
+        
+        btn_pause = ttk.Button(ctrl_btn_frame, text="Pause (Manual Tilt Only)", command=self.node.pause_control)
+        btn_pause.pack(side='left', expand=True, padx=2)
+        btn_resume = ttk.Button(ctrl_btn_frame, text="Resume Control (PD ON)", command=self.node.resume_control)
+        btn_resume.pack(side='right', expand=True, padx=2)
+        
+        btn_zero = ttk.Button(right_col, text="Set Force Zero (Tactile Offset)", command=self.node.set_force_zero)
+        btn_zero.pack(fill='x', pady=2)
+
+        self.update_ui_loop()
+
+    def action_load_config(self):
+        self.node.load_config()
+        self.sl_kp_ball.set(self.node.Kp_ball)
+        self.sl_kd_ball.set(self.node.Kd_ball)
+        self.sl_max_tilt.set(self.node.max_tilt_deg)
+        self.slider_roll_offset.set(np.degrees(self.node.roll_offset_rad))
+        self.slider_pitch_offset.set(np.degrees(self.node.pitch_offset_rad))
+        
+        for name, idx, _ in self.gains_def_list:
+            self.hw_sliders[name].set(self.node.target_data[idx])
+            
+        print("[System] Config successfully loaded and synced to UI.")
+
+    def action_save_config(self):
+        self.node.save_config()
+        print("[System] Config successfully saved.")
+
+    def update_ball_gain(self, name, value):
+        val = float(value)
+        if name == "Kp":
+            self.node.Kp_ball = val
+            self.lbl_kp_ball.config(text=f"Kp_ball: {val:.3f}")
+        elif name == "Kd":
+            self.node.Kd_ball = val
+            self.lbl_kd_ball.config(text=f"Kd_ball: {val:.3f}")
+
+    def update_max_tilt(self, value):
+        val = float(value)
+        self.node.max_tilt_deg = val
+        self.node.MAX_TILT_RAD = np.radians(val)
+        self.lbl_max_tilt.config(text=f"Max Tilt Angle: {val:.1f} deg")
+
+    def update_hw_gain(self, idx, value, name):
+        val = float(value)
+        self.node.target_data[idx] = val
+        if self.node.shm_connected_pose and self.node.pose_array is not None:
+            self.node.pose_array[idx] = val
+        self.gain_labels[name].config(text=f"{name}: {val:>7.3f}")
+
+    def update_offset_value(self, name, value):
+        val_deg = float(value)
+        val_rad = np.radians(val_deg)
+        if name == "roll":
+            self.node.roll_offset_rad = val_rad
+            self.lbl_roll_offset.config(text=f"Roll Offset: {val_deg:>7.3f}")
+        elif name == "pitch":
+            self.node.pitch_offset_rad = val_rad
+            self.lbl_pitch_offset.config(text=f"Pitch Offset: {val_deg:>7.3f}")
+
+    def update_ui_loop(self):
+        if self.node.shm_connected_ball:
+            # {:>6.1f} 등을 사용해 부호(-) 유무와 관계없이 우측 정렬 및 동일 칸 크기 유지
+            self.lbl_curr_raw.config(text=f"Raw 1: {self.node.curr_f1_raw:>6.1f} | Raw 2: {self.node.curr_f2_raw:>6.1f} | Raw 3: {self.node.curr_f3_raw:>6.1f}")
+            self.lbl_curr_res.config(text=f"Res 1: {self.node.curr_f1_res:>6.1f} | Res 2: {self.node.curr_f2_res:>6.1f} | Res 3: {self.node.curr_f3_res:>6.1f}")
+            
+            if self.node.ball_detected:
+                self.lbl_ball_status.config(text="Ball: DETECTED", foreground="blue")
+                self.lbl_ball_pos.config(text=f"Pos (X, Y): {self.node.curr_ball_x:>6.3f}, {self.node.curr_ball_y:>6.3f}")
+                self.lbl_ball_vel.config(text=f"Vel (Vx, Vy): {self.node.curr_ball_vx:>6.3f}, {self.node.curr_ball_vy:>6.3f}")
+            else:
+                self.lbl_ball_status.config(text=f"Ball: NOT DETECTED (f_total < {F_TOTAL_MIN}gf)", foreground="red")
+                self.lbl_ball_pos.config(text="Pos (X, Y):      - ,      -")
+                self.lbl_ball_vel.config(text="Vel (Vx, Vy):     - ,      -")
+        
+        self.lbl_actual_freq.config(text=f"Actual Freq: {self.node.actual_freq:>5.1f} Hz")
+
+        if self.node.shm_connected_pose and self.node.eef_force_array is not None:
+            self.lbl_eef_force.config(text=f"EEF Forces (gf) - F1: {self.node.eef_force_array[0]:>6.1f} | F2: {self.node.eef_force_array[1]:>6.1f} | F3: {self.node.eef_force_array[2]:>6.1f}")
+
+        self.root.after(100, self.update_ui_loop)
+
+    def run(self):
+        self.root.mainloop()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = BallBalancingNode()
+    ros_thread = threading.Thread(target=lambda: rclpy.spin(node), daemon=True)
+    ros_thread.start()
+
+    try:
+        ui = TuningUI(node)
+        ui.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if len(node.csv_data) > 0:
+            filename = "ball_balancing_log.csv"
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    # [수정] CSV 상단 헤더 목록 끝에 eef_force_1, 2, 3 추가 명시
+                    writer.writerow([
+                        'timestamp', 'roll_rad', 'pitch_rad', 
+                        'f1_raw', 'f2_raw', 'f3_raw', 
+                        'f1_res', 'f2_res', 'f3_res',
+                        'ball_x', 'ball_y', 'ball_vx', 'ball_vy',
+                        'eef_force_1', 'eef_force_2', 'eef_force_3'
+                    ])
+                    writer.writerows(node.csv_data)
+                print(f"\n[CSV 저장] '{filename}'에 데이터를 성공적으로 저장했습니다.")
+            except Exception as e:
+                print(f"\n[CSV 저장 실패] 에러 발생: {e}")
+        
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

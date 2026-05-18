@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>torque_controller</name>
+  <version>0.0.0</version>
+  <description>TODO: Package description</description>
+  <maintainer email="kimdonghwi@todo.todo">kimdonghwi</maintainer>
+  <license>TODO: License declaration</license>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>dynamixel_sdk</depend>
+
+  <depend>rclpy</depend>
+  <depend>robot_interfaces</depend>
+  <depend>sensor_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_mypy</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>ament_xmllint</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <depend>visualization_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>pinocchio</depend>
+  <depend>ament_index_cpp</depend>
+  <build_depend>eigen</build_depend>
+  <exec_depend>eigen</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
