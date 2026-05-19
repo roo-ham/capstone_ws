@@ -14,7 +14,7 @@ import csv
 import cv2  # OpenCV 추가
 
 F_TOTAL_MIN = 5
-PLATE_MASS = 0.2347  # kg
+PLATE_MASS = 234.7  # gf
 N_TO_GF = 101.97162
 
 class BallBalancingNode(Node):
@@ -124,6 +124,10 @@ class BallBalancingNode(Node):
 
         self.acts = None
         self.f_integral = np.zeros(3)
+        self.pid_p_2d = np.zeros(2)
+        self.pid_i_2d = np.zeros(2)
+        self.pid_d_2d = np.zeros(2)
+        self.cmd_tilt_disp = np.zeros(2)
 
     def load_force_coeffs(self):
         defaults = np.array([
@@ -327,23 +331,37 @@ class BallBalancingNode(Node):
             self.curr_f3_res = self.curr_f3_raw - f3_exp
 
             # --- 5. CoP 계산 (raw measurement) ---
-            f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res
+            cos_product = np.cos(self.target_data[3]) * np.cos(self.target_data[4])
+            f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res - PLATE_MASS * cos_product
 
             avg_eef_x = (self.eef_array[0] + self.eef_array[3] + self.eef_array[6]) / 3.0
             avg_eef_y = (self.eef_array[1] + self.eef_array[4] + self.eef_array[7]) / 3.0
 
+            avg_eef_vx = (self.eef_dot_array[0] + self.eef_dot_array[3] + self.eef_dot_array[6]) / 3.0
+            avg_eef_vy = (self.eef_dot_array[1] + self.eef_dot_array[4] + self.eef_dot_array[7]) / 3.0
+
             if f_total > 0.0:
-                cop_x = (self.eef_array[0] * self.curr_f1_res +
+                bx = (self.eef_array[0] * self.curr_f1_res +
                          self.eef_array[3] * self.curr_f2_res +
-                         self.eef_array[6] * self.curr_f3_res) / f_total
-                cop_y = (self.eef_array[1] * self.curr_f1_res +
+                         self.eef_array[6] * self.curr_f3_res -
+                         avg_eef_x * PLATE_MASS * cos_product) / f_total
+                by = (self.eef_array[1] * self.curr_f1_res +
                          self.eef_array[4] * self.curr_f2_res +
-                         self.eef_array[7] * self.curr_f3_res) / f_total
-                bx = cop_x - avg_eef_x
-                by = cop_y - avg_eef_y
+                         self.eef_array[7] * self.curr_f3_res -
+                         avg_eef_y * PLATE_MASS * cos_product) / f_total
+                bvx = (self.eef_array[0] * df_raw[0] +
+                         self.eef_array[3] * df_raw[1] +
+                         self.eef_array[6] * df_raw[2] -
+                         avg_eef_x * PLATE_MASS * cos_product) / f_total
+                bvy = (self.eef_array[1] * df_raw[0] +
+                         self.eef_array[4] * df_raw[1] +
+                         self.eef_array[7] * df_raw[2] -
+                         avg_eef_y * PLATE_MASS * cos_product) / f_total
             else:
-                bx = 0.0
-                by = 0.0
+                bx = avg_eef_x
+                by = avg_eef_y
+                bvx = avg_eef_vx
+                bvy = avg_eef_vy
 
             # --- 6. Kalman Filter: 공 상태 추정 ---
             # Predict: tilt command → expected ball dynamics
@@ -385,24 +403,33 @@ class BallBalancingNode(Node):
             
             # f_vz = np.array([f1_vz, f2_vz, f3_vz])
 
-            dirs = np.array([[0.7, -0.7], [-0.7, -0.7], [0.0, 1.0]])
+            # dirs = np.array([[0.7, -0.7], [-0.7, -0.7], [0.0, 1.0]])
             # new_acts = dirs * (self.Kp_ball * f_err[:, None] + self.Kd_ball * df_covar[:, None])
-            acts_no_filter = dirs * (self.Kp_ball * f_err[:, None] + self.Ki_ball * self.f_integral[:, None])
+
+            # p_per_sensor = dirs * (self.Kp_ball * f_err[:, None])        # (3,2)
+            # i_per_sensor = dirs * (self.Ki_ball * self.f_integral[:, None])  # (3,2)
+            # acts_no_filter = p_per_sensor + i_per_sensor
             # 양수면 멀어지고 음수면 가까이 오는 식
 
-            INTEGRAL_MAX = 50.0
-            self.f_integral = np.clip(self.f_integral + f_err * self.dt, -INTEGRAL_MAX, INTEGRAL_MAX)
+            # INTEGRAL_MAX = 50.0
+            # self.f_integral = np.clip(self.f_integral + f_err * self.dt, -INTEGRAL_MAX, INTEGRAL_MAX)
 
 
-            TAU = 0.001
-            new_acts = dirs * self.Kd_ball * df_deadband[:, None]
-            if self.acts is None:
-                self.acts = new_acts
-            self.acts = (1 - TAU) * self.acts + 1.000 * TAU * new_acts
-            act_1, act_2, act_3 = self.acts + acts_no_filter
+            # TAU = 0.001
+            # new_acts = dirs * self.Kd_ball * df_deadband[:, None]
+            # if self.acts is None:
+                # self.acts = new_acts
+            # self.acts = (1 - TAU) * self.acts + 1.000 * TAU * new_acts
+            # act_1, act_2, act_3 = self.acts + acts_no_filter
 
             if (not self.is_paused) and self.ball_detected:
-                cmd_tilt = (act_1 + act_2 + act_3) / 3
+                cmd_tilt = self.Kp_ball * (np.array([avg_eef_x - bx, avg_eef_y - by])) + self.Kd_ball * (np.array([avg_eef_vx - bvx, avg_eef_vy - bvy]))
+            #     cmd_tilt = (act_1 + act_2 + act_3) / 3
+
+            # self.pid_p_2d = np.sum(p_per_sensor, axis=0) / 3
+            # self.pid_i_2d = np.sum(i_per_sensor, axis=0) / 3
+            # self.pid_d_2d = np.sum(self.acts, axis=0) / 3
+            # self.cmd_tilt_disp = cmd_tilt.copy()
 
             cmd_tilt = np.clip(cmd_tilt, -self.MAX_TILT_RAD, self.MAX_TILT_RAD)
 
@@ -492,19 +519,32 @@ class TuningUI:
         self.lbl_eef_force = ttk.Label(state_frame, text="EEF Forces (gf) - F1:   0.0 | F2:   0.0 | F3:   0.0", style="DataHeader.TLabel", foreground="purple", width=65)
         self.lbl_eef_force.pack(anchor='w', pady=2)
 
-        # --- [Left] 독립형 볼 제어 파라미터 (PD) ---
+        # --- [Left] PID Components ---
+        pid_comp_frame = ttk.LabelFrame(left_col, text=" PID Components (2D) ", padding=5)
+        pid_comp_frame.pack(fill='x', pady=2)
+
+        self.lbl_cmd_tilt = ttk.Label(pid_comp_frame, text="cmd_tilt: [pitch:   0.000, roll:   0.000] rad", style="Data.TLabel", foreground="darkred", width=55)
+        self.lbl_cmd_tilt.pack(anchor='w', pady=2)
+        self.lbl_p_term = ttk.Label(pid_comp_frame, text="Kp*P:     [pitch:   0.000, roll:   0.000] rad", style="Data.TLabel", foreground="#e74c3c", width=55)
+        self.lbl_p_term.pack(anchor='w', pady=2)
+        self.lbl_i_term = ttk.Label(pid_comp_frame, text="Ki*I:     [pitch:   0.000, roll:   0.000] rad", style="Data.TLabel", foreground="#2ecc71", width=55)
+        self.lbl_i_term.pack(anchor='w', pady=2)
+        self.lbl_d_term = ttk.Label(pid_comp_frame, text="Kd*D:     [pitch:   0.000, roll:   0.000] rad", style="Data.TLabel", foreground="#3498db", width=55)
+        self.lbl_d_term.pack(anchor='w', pady=2)
+
+        # --- [Left] 독립형 볼 제어 파라미터 (PID) ---
         pd_frame = ttk.LabelFrame(left_col, text=" Ball Controller (PID) ", padding=5)
         pd_frame.pack(fill='x', pady=5)
 
         self.lbl_kp_ball = ttk.Label(pd_frame, text=f"Kp_ball: {self.node.Kp_ball:.3f}", width=20)
         self.lbl_kp_ball.pack(anchor='w')
-        self.sl_kp_ball = ttk.Scale(pd_frame, from_=0, to=0.02, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
+        self.sl_kp_ball = ttk.Scale(pd_frame, from_=0, to=20, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
         self.sl_kp_ball.set(self.node.Kp_ball)
         self.sl_kp_ball.pack(fill='x', expand=True, pady=(0,5))
 
         self.lbl_kd_ball = ttk.Label(pd_frame, text=f"Kd_ball: {self.node.Kd_ball:.3f}", width=20)
         self.lbl_kd_ball.pack(anchor='w')
-        self.sl_kd_ball = ttk.Scale(pd_frame, from_=0, to=0.1, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
+        self.sl_kd_ball = ttk.Scale(pd_frame, from_=0, to=1.0, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
         self.sl_kd_ball.set(self.node.Kd_ball)
         self.sl_kd_ball.pack(fill='x', expand=True, pady=(0,5))
 
@@ -757,6 +797,11 @@ class TuningUI:
 
         if self.node.shm_connected_pose and self.node.eef_force_array is not None:
             self.lbl_eef_force.config(text=f"EEF Forces (gf) - F1: {self.node.eef_force_array[0]:>6.1f} | F2: {self.node.eef_force_array[1]:>6.1f} | F3: {self.node.eef_force_array[2]:>6.1f}")
+
+        self.lbl_cmd_tilt.config(text=f"cmd_tilt: [pitch: {self.node.cmd_tilt_disp[0]:>7.4f}, roll: {self.node.cmd_tilt_disp[1]:>7.4f}] rad")
+        self.lbl_p_term.config(text=f"Kp*P:     [pitch: {self.node.pid_p_2d[0]:>7.4f}, roll: {self.node.pid_p_2d[1]:>7.4f}] rad")
+        self.lbl_i_term.config(text=f"Ki*I:     [pitch: {self.node.pid_i_2d[0]:>7.4f}, roll: {self.node.pid_i_2d[1]:>7.4f}] rad")
+        self.lbl_d_term.config(text=f"Kd*D:     [pitch: {self.node.pid_d_2d[0]:>7.4f}, roll: {self.node.pid_d_2d[1]:>7.4f}] rad")
 
         # 2. [신설] OpenCV 500x500 실시간 위치 시각화 맵 드로잉 모듈
         if self.node.show_gui:
