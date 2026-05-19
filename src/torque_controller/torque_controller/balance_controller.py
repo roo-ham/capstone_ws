@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Empty
 import numpy as np
 from multiprocessing import shared_memory
 import threading
@@ -37,8 +36,8 @@ class BallBalancingNode(Node):
         self.eef_array = None
         self.shm_eef_force = None
         self.eef_force_array = None
-        self.shm_eef_dot = None
-        self.eef_dot_array = None
+        self.shm_eef_vel = None
+        self.eef_vel_array = None
         
         self.shm_connected_ball = False
         self.shm_connected_pose = False
@@ -114,7 +113,6 @@ class BallBalancingNode(Node):
         q = 0.02 * 9.81 * 0.17
         self.kf_Q = np.diag([q**2*dt**4/4, q**2*dt**4/4, q**2*dt**2, q**2*dt**2])
 
-        self.zero_pub = self.create_publisher(Empty, 'set_force_zero', 10)
         self.get_logger().info("Ball Balancing Node Starting...")
 
         self.declare_parameter('show_gui', True)
@@ -242,9 +240,6 @@ class BallBalancingNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to save config: {e}")
 
-    def set_force_zero(self):
-        self.zero_pub.publish(Empty())
-
     def pause_control(self):
         self.is_paused = True
 
@@ -263,7 +258,7 @@ class BallBalancingNode(Node):
                 pass
 
         if not self.shm_connected_pose:
-            if os.path.exists('/dev/shm/target_pose_shm') and os.path.exists('/dev/shm/eef_pos_shm') and os.path.exists('/dev/shm/eef_force_shm') and os.path.exists('/dev/shm/eef_dot_shm'):
+            if os.path.exists('/dev/shm/target_pose_shm') and os.path.exists('/dev/shm/eef_pos_shm') and os.path.exists('/dev/shm/eef_force_shm') and os.path.exists('/dev/shm/eef_vel_shm'):
                 self.shm_pose = shared_memory.SharedMemory(name='target_pose_shm', create=False)
                 self.pose_array = np.ndarray((12,), dtype=np.float64, buffer=self.shm_pose.buf)
                 
@@ -273,20 +268,20 @@ class BallBalancingNode(Node):
                 self.shm_eef_force = shared_memory.SharedMemory(name='eef_force_shm', create=False)
                 self.eef_force_array = np.ndarray((3,), dtype=np.float64, buffer=self.shm_eef_force.buf)
 
-                self.shm_eef_dot = shared_memory.SharedMemory(name='eef_dot_shm', create=False)
-                self.eef_dot_array = np.ndarray((9,), dtype=np.float64, buffer=self.shm_eef_dot.buf)
+                self.shm_eef_vel = shared_memory.SharedMemory(name='eef_vel_shm', create=False)
+                self.eef_vel_array = np.ndarray((9,), dtype=np.float64, buffer=self.shm_eef_vel.buf)
 
                 from multiprocessing.resource_tracker import unregister
                 unregister(self.shm_pose._name, 'shared_memory')
                 unregister(self.shm_eef._name, 'shared_memory')
                 unregister(self.shm_eef_force._name, 'shared_memory')
-                unregister(self.shm_eef_dot._name, 'shared_memory')
+                unregister(self.shm_eef_vel._name, 'shared_memory')
                 
                 self.pose_array[:] = self.target_data[:]
                 self.shm_connected_pose = True
 
     def control_loop(self):
-        if self.shm_connected_pose and (not os.path.exists('/dev/shm/target_pose_shm') or not os.path.exists('/dev/shm/eef_pos_shm') or not os.path.exists('/dev/shm/eef_force_shm') or not os.path.exists('/dev/shm/eef_dot_shm')):
+        if self.shm_connected_pose and (not os.path.exists('/dev/shm/target_pose_shm') or not os.path.exists('/dev/shm/eef_pos_shm') or not os.path.exists('/dev/shm/eef_force_shm') or not os.path.exists('/dev/shm/eef_vel_shm')):
             os._exit(0)
 
         self.loop_count += 1
@@ -308,10 +303,10 @@ class BallBalancingNode(Node):
             df_raw = curr_raw[3:6]  # df from tracker (raw force derivative)
 
             # --- 2. 손가락 Z속도(global frame) 평균 → 게인 스케줄링용 ---
-            if self.eef_dot_array is not None:
-                f1_vz = self.eef_dot_array[2]
-                f2_vz = self.eef_dot_array[5]
-                f3_vz = self.eef_dot_array[8]
+            if self.eef_vel_array is not None:
+                f1_vz = self.eef_vel_array[2]
+                f2_vz = self.eef_vel_array[5]
+                f3_vz = self.eef_vel_array[8]
                 z_vel_raw = (f1_vz + f2_vz + f3_vz) / 3.0
                 self.z_vel_filt = 0.85 * self.z_vel_filt + 0.15 * z_vel_raw
             else:
@@ -337,8 +332,8 @@ class BallBalancingNode(Node):
             avg_eef_x = (self.eef_array[0] + self.eef_array[3] + self.eef_array[6]) / 3.0
             avg_eef_y = (self.eef_array[1] + self.eef_array[4] + self.eef_array[7]) / 3.0
 
-            avg_eef_vx = (self.eef_dot_array[0] + self.eef_dot_array[3] + self.eef_dot_array[6]) / 3.0
-            avg_eef_vy = (self.eef_dot_array[1] + self.eef_dot_array[4] + self.eef_dot_array[7]) / 3.0
+            avg_eef_vx = (self.eef_vel_array[0] + self.eef_vel_array[3] + self.eef_vel_array[6]) / 3.0
+            avg_eef_vy = (self.eef_vel_array[1] + self.eef_vel_array[4] + self.eef_vel_array[7]) / 3.0
 
             if f_total > 0.0:
                 bx = (self.eef_array[0] * self.curr_f1_res +
@@ -439,7 +434,7 @@ class BallBalancingNode(Node):
             self.pose_array[:] = self.target_data[:]
 
             # --- 8. CSV 로깅 ---
-            eef_vel = list(self.eef_dot_array) if self.eef_dot_array is not None else [0.0]*9
+            eef_vel = list(self.eef_vel_array) if self.eef_vel_array is not None else [0.0]*9
             eef_cur = list(self.eef_force_array) if (self.shm_connected_pose and self.eef_force_array is not None) else [0.0]*3
             f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res
             cop_x_raw = (self.eef_array[0]*self.curr_f1_res + self.eef_array[3]*self.curr_f2_res + self.eef_array[6]*self.curr_f3_res) if f_total > 0 else 0.0
@@ -469,7 +464,7 @@ class BallBalancingNode(Node):
         if self.shm_pose: self.shm_pose.close()
         if self.shm_eef: self.shm_eef.close()
         if self.shm_eef_force: self.shm_eef_force.close()
-        if self.shm_eef_dot: self.shm_eef_dot.close()
+        if self.shm_eef_vel: self.shm_eef_vel.close()
         if self.show_gui: cv2.destroyAllWindows()
         super().destroy_node()
 
@@ -676,9 +671,6 @@ class TuningUI:
         # Enable after 5s auto-zero
         self.root.after(5000, self.enable_resume_button)
         
-        btn_zero = ttk.Button(right_col, text="Set Force Zero (Tactile Offset)", command=self.node.set_force_zero)
-        btn_zero.pack(fill='x', pady=2)
-
         # [추가] OpenCV 실시간 모니터링 윈도우 생성 초기화
         if self.node.show_gui:
             cv2.namedWindow("Ball & EEF Position Map", cv2.WINDOW_AUTOSIZE)

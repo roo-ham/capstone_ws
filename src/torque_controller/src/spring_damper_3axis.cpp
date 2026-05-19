@@ -46,12 +46,12 @@ public:
         munmap(cmd_ptr_, 12 * sizeof(double));
         if (pose_ptr_) munmap(pose_ptr_, 12 * sizeof(double));
         if (eef_ptr_) munmap(eef_ptr_, 9 * sizeof(double));
-        if (eef_dot_ptr_) munmap(eef_dot_ptr_, 9 * sizeof(double));
+        if (eef_vel_ptr_) munmap(eef_vel_ptr_, 9 * sizeof(double));
         if (eef_force_ptr_) munmap(eef_force_ptr_, 3 * sizeof(double)); // [신설] 메모리 해제
         
         shm_unlink("target_pose_shm");
         shm_unlink("eef_pos_shm");
-        shm_unlink("eef_dot_shm");
+        shm_unlink("eef_vel_shm");
         shm_unlink("eef_force_shm"); // [신설] 언링크
     }
 
@@ -67,7 +67,7 @@ private:
     double* cmd_ptr_ = nullptr;
     double* pose_ptr_ = nullptr; 
     double* eef_ptr_ = nullptr; 
-    double* eef_dot_ptr_ = nullptr;
+    double* eef_vel_ptr_ = nullptr;
     double* eef_force_ptr_ = nullptr; // [신설] EEF 힘 저장용 포인터 추가 (3차원 double)
     bool pose_shared_memory_ = true;
 
@@ -162,12 +162,12 @@ private:
         ftruncate(fd_eef, 9 * sizeof(double));
         eef_ptr_ = (double*)mmap(0, 9 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef, 0);
 
-        // --- 3. EEF Dot SHM (S->B, 9차원: 3 fingers × XYZ velocity in global frame) ---
-        shm_unlink("eef_dot_shm");
-        int fd_eef_dot = shm_open("eef_dot_shm", O_CREAT | O_RDWR, 0666);
-        ftruncate(fd_eef_dot, 9 * sizeof(double));
-        eef_dot_ptr_ = (double*)mmap(0, 9 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef_dot, 0);
-        for (int i = 0; i < 9; ++i) eef_dot_ptr_[i] = 0.0;
+        // --- 3. EEF Vel SHM (S->B, 9차원: 3 fingers × XYZ velocity in global frame) ---
+        shm_unlink("eef_vel_shm");
+        int fd_eef_vel = shm_open("eef_vel_shm", O_CREAT | O_RDWR, 0666);
+        ftruncate(fd_eef_vel, 9 * sizeof(double));
+        eef_vel_ptr_ = (double*)mmap(0, 9 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef_vel, 0);
+        for (int i = 0; i < 9; ++i) eef_vel_ptr_[i] = 0.0;
 
         // --- 4. EEF Force SHM [신설] (S->B, 3차원 강제 생성) ---
         shm_unlink("eef_force_shm");
@@ -176,7 +176,7 @@ private:
         eef_force_ptr_ = (double*)mmap(0, 3 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef_force, 0);
         for (int i = 0; i < 3; ++i) eef_force_ptr_[i] = 0.0;
 
-        RCLCPP_INFO(this->get_logger(), "S Node strictly created SHMs (target_pose_shm, eef_pos_shm, eef_dot_shm, eef_force_shm)");
+        RCLCPP_INFO(this->get_logger(), "S Node strictly created SHMs (target_pose_shm, eef_pos_shm, eef_vel_shm, eef_force_shm)");
     }
 
     void init_pinocchio() {
@@ -284,11 +284,11 @@ private:
                     eef_ptr_[i * 3 + 2] = curr_pos_[i].z();
                 }
 
-                // --- [수정] eef_dot_shm: 각 손가락의 XYZ 속도(global frame) 기록 (S -> B) ---
-                if (eef_dot_ptr_ != nullptr) {
-                    eef_dot_ptr_[i * 3 + 0] = curr_vel_[i].x();
-                    eef_dot_ptr_[i * 3 + 1] = curr_vel_[i].y();
-                    eef_dot_ptr_[i * 3 + 2] = curr_vel_[i].z();
+                // --- [수정] eef_vel_shm: 각 손가락의 XYZ 속도(global frame) 기록 (S -> B) ---
+                if (eef_vel_ptr_ != nullptr) {
+                    eef_vel_ptr_[i * 3 + 0] = curr_vel_[i].x();
+                    eef_vel_ptr_[i * 3 + 1] = curr_vel_[i].y();
+                    eef_vel_ptr_[i * 3 + 2] = curr_vel_[i].z();
                 }
 
                 Eigen::Vector3d evx = i_pitch.dot(curr_vel_[i]) * i_pitch;

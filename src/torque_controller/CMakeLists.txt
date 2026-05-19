@@ -29,16 +29,6 @@ set(CMAKE_AUTORCC ON)
 find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp)
 include_directories(${NLOHMANN_JSON_INCLUDE_DIR})
 
-add_executable(tactile_ball_tracker src/tactile_ball_tracker.cpp)
-target_include_directories(tactile_ball_tracker PUBLIC ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(tactile_ball_tracker PUBLIC
-  ${OpenCV_LIBRARIES}
-  rt
-  pthread
-  rclcpp::rclcpp
-  ${std_msgs_TARGETS}
-)
-
 add_executable(tactile_ball_tracker_debug src/tactile_ball_tracker_debug.cpp)
 target_include_directories(tactile_ball_tracker_debug PUBLIC ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(tactile_ball_tracker_debug PUBLIC
@@ -46,17 +36,6 @@ target_link_libraries(tactile_ball_tracker_debug PUBLIC
   rt
   pthread
   rclcpp::rclcpp
-  ${std_msgs_TARGETS}
-)
-
-add_executable(tactile_ball_tracker_fit src/tactile_ball_tracker_fit.cpp)
-target_include_directories(tactile_ball_tracker_fit PUBLIC ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(tactile_ball_tracker_fit PUBLIC
-  ${OpenCV_LIBRARIES}
-  rt
-  pthread
-  rclcpp::rclcpp
-  ${std_msgs_TARGETS}
   Qt5::Widgets
 )
 
@@ -118,13 +97,8 @@ target_link_libraries(spring_damper_3axis PUBLIC
 
 # (B) Python 노드 설치
 install(PROGRAMS
-  torque_controller/fingertip_server.py
-  torque_controller/jacobian_server.py
-  torque_controller/task_space_control.py
   torque_controller/joint_current_tester.py
-  torque_controller/spring_damper_ui_node.py
   torque_controller/position_controller.py
-  torque_controller/dynamixel_shm_interface.py
   torque_controller/visual_ball_tracker_node.py
   torque_controller/balance_controller.py
   torque_controller/axis_controller.py
@@ -148,9 +122,7 @@ install(TARGETS
   spring_damper_cpp
   spring_damper_3axis
   ball_tracker_node
-  tactile_ball_tracker
   tactile_ball_tracker_debug
-  tactile_ball_tracker_fit
   ball_calibration_node
   DESTINATION lib/${PROJECT_NAME}
 )

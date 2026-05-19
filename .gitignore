@@ -31,4 +31,5 @@ log/
 *.bak
 
 # Misc
-my_photo.jpg
+*.jpg
+*.png

@@ -11,8 +11,20 @@
 #include <mutex>
 #include <cmath>
 #include <chrono>
-#include <algorithm> 
-#include <std_msgs/msg/empty.hpp>
+#include <algorithm>
+#include <atomic>
+#include <QApplication>
+#include <QWidget>
+#include <QGridLayout>
+#include <QLineEdit>
+#include <QLabel>
+#include <QPushButton>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QGroupBox>
+#include <QTimer>
+#include <QFont>
+#include <signal.h>
 
 using json = nlohmann::json;
 using namespace std::chrono_literals;
@@ -20,61 +32,47 @@ using namespace std::chrono_literals;
 struct SensorData {
     double force = 0.0;
     double last_area = 0.0;
-    double zero_area = 0.0;
-    
-    double k_val = 100.0; 
-    double b_val = 100.0; 
+
+    double k_val = 100.0;
+    double b_val = 100.0;          // additive offset: force = k*A + b
+
     int target_fps = 60;
-    
-    std::vector<cv::Point> trap_pts; 
-    cv::Mat mask;                    
-    cv::UMat u_mask;                    
+    std::atomic<bool> camera_ok{false};
+
+    std::vector<cv::Point> trap_pts;
+    cv::Mat mask;
+    cv::UMat u_mask;
 
     int thresh = 120;
+    int base_thresh = 120;
+
+    // Adaptive threshold: ref_roi brightness tracking (drift compensation)
+    cv::Rect ref_roi = cv::Rect(5, 5, 30, 30);
+    double ref_brightness = 0.0;   // runtime EMA-filtered brightness in ref_roi
+    double ref_baseline = -1.0;    // -1 = not initialized
+    int warmup_count = 0;
+    static constexpr int WARMUP_FRAMES = 200;
+
     double current_fps = 0.0;
-    
     cv::Mat display_img;
 };
 
+// ─── Forward declare ───
+class TrackerQtGui;
+
+// ─── Main Node ───
 class TactileBallTracker : public rclcpp::Node {
 public:
     TactileBallTracker() : Node("tactile_ball_tracker") {
-        last_time_ = this->now(); 
-        
+        last_time_ = this->now();
+
         load_config();
         init_shm();
-        
+
         this->declare_parameter("fps_limit", 60);
         this->declare_parameter("filter_alpha", 1.0);
-        this->declare_parameter("show_gui", true);
-
-        zero_sub_ = this->create_subscription<std_msgs::msg::Empty>(
-                "set_force_zero", 10,
-                [this](const std_msgs::msg::Empty::SharedPtr /*msg*/) {
-            std::lock_guard<std::mutex> lock(data_mutex_);
-
-            for (int i = 0; i < 3; ++i) {
-                sensors_[i].b_val = -sensors_[i].last_area;
-                // b_val만 업데이트, threshold는 고정 120
-            }
-
-            // Save b_val to JSON (persist across restarts)
-            {
-                std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
-                json j;
-                if (file.is_open()) { file >> j; file.close(); }
-                if (j.contains("cameras")) {
-                    for (int i = 0; i < 3; ++i) {
-                        if (j["cameras"].size() > (size_t)i) {
-                            j["cameras"][i]["b_slider"] = sensors_[i].b_val;
-                        }
-                    }
-                    std::ofstream out("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
-                    if (out.is_open()) { out << j.dump(4); out.close(); }
-                }
-            }
-            RCLCPP_INFO(this->get_logger(), "Set Force Zero: b_val updated, ref intact. Saved to JSON.");
-        });
+        this->declare_parameter("show_gui", false);
+        this->declare_parameter("show_qt_gui", true);
 
         for (int i = 0; i < 3; ++i) {
             running_ = true;
@@ -86,11 +84,11 @@ public:
 
         ui_timer_ = this->create_wall_timer(
             100ms, std::bind(&TactileBallTracker::update_terminal_ui, this));
-        
+
         cv::ocl::setUseOpenCL(true);
-        RCLCPP_INFO(this->get_logger(), "OpenCL Acceleration: %s", 
+        RCLCPP_INFO(this->get_logger(), "OpenCL Acceleration: %s",
                     cv::ocl::useOpenCL() ? "ENABLED" : "DISABLED");
-        RCLCPP_INFO(this->get_logger(), "Optimized Tactile Ball Tracker Node Started.");
+        RCLCPP_INFO(this->get_logger(), "Tactile Ball Tracker Node Started.");
     }
 
     ~TactileBallTracker() {
@@ -98,6 +96,9 @@ public:
         for (auto& th : capture_threads_) {
             if (th.joinable()) th.join();
         }
+
+        // Save ref_baseline to JSON
+        save_ref_baseline();
 
         munmap(shm_ptr_, 7 * sizeof(double));
         close(fd_shm_);
@@ -113,21 +114,45 @@ public:
         if (show_gui_) cv::destroyAllWindows();
     }
 
+    SensorData* sensors() { return sensors_; }
+    std::mutex& data_mutex() { return data_mutex_; }
+
+    void set_k(int idx, double new_k) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        sensors_[idx].k_val = new_k;
+        save_config_json();
+        RCLCPP_INFO(this->get_logger(), "Sensor %d: k = %.6f", idx+1, new_k);
+    }
+
+    void set_zero(int idx) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        double a = sensors_[idx].last_area;
+        sensors_[idx].b_val = -(sensors_[idx].k_val * a);
+        save_config_json();
+        RCLCPP_INFO(this->get_logger(), "Sensor %d: zeroed, b = -k*A = %.2f (A=%.1f)", idx+1, sensors_[idx].b_val, a);
+    }
+
+    void adjust_baseline(int idx, int delta) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        sensors_[idx].ref_baseline += (double)delta;
+        if (sensors_[idx].ref_baseline < 1.0) sensors_[idx].ref_baseline = 1.0;
+        RCLCPP_INFO(this->get_logger(), "Sensor %d: ref_baseline += %d → %.1f", idx+1, delta, sensors_[idx].ref_baseline);
+    }
+
 private:
-    double* shm_ptr_; 
-    double* pose_ptr_ = nullptr; 
+    double* shm_ptr_;
+    double* pose_ptr_ = nullptr;
     int fd_shm_, fd_pose_ = -1;
 
     std::vector<std::thread> capture_threads_;
     bool running_;
     SensorData sensors_[3];
     std::string camera_sources_[3];
-    std::string rpicam_cmds_[3]; 
-    
+    std::string rpicam_cmds_[3];
+
     std::mutex data_mutex_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr ui_timer_;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr zero_sub_;
     bool show_gui_ = true;
 
     rclcpp::Time last_time_;
@@ -137,11 +162,9 @@ private:
     void init_shm() {
         shm_unlink("ball_state_shm");
         fd_shm_ = shm_open("ball_state_shm", O_CREAT | O_RDWR, 0666);
-        
         ftruncate(fd_shm_, 7 * sizeof(double));
         shm_ptr_ = (double*)mmap(0, 7 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_shm_, 0);
         std::fill(shm_ptr_, shm_ptr_ + 7, 0.0);
-
         connect_pose_shm();
     }
 
@@ -168,7 +191,7 @@ private:
             file >> j;
             for (int i = 0; i < 3; ++i) {
                 camera_sources_[i] = j["cameras"][i]["source"].get<std::string>();
-                
+
                 if (j["cameras"][i].contains("rpicam_cmd")) {
                     rpicam_cmds_[i] = j["cameras"][i]["rpicam_cmd"].get<std::string>();
                 } else {
@@ -176,15 +199,65 @@ private:
                 }
 
                 sensors_[i].k_val = j["cameras"][i]["k_slider"];
-                sensors_[i].b_val = j["cameras"][i]["b_slider"];
-                sensors_[i].zero_area = j["cameras"][i]["zero_area"];
-                
+                sensors_[i].b_val = j["cameras"][i].value("b_slider", 0.0);
+
+                // ref_roi for adaptive threshold
+                if (j["cameras"][i].contains("ref_roi")) {
+                    auto& rr = j["cameras"][i]["ref_roi"];
+                    sensors_[i].ref_roi = cv::Rect(rr[0], rr[1], rr[2], rr[3]);
+                }
+
+                // restore ref_baseline (if saved, skip warmup)
+                if (j["cameras"][i].contains("ref_baseline") && j["cameras"][i]["ref_baseline"].get<double>() > 0.0) {
+                    sensors_[i].ref_baseline = j["cameras"][i]["ref_baseline"];
+                    sensors_[i].warmup_count = SensorData::WARMUP_FRAMES;
+                    RCLCPP_INFO(this->get_logger(), "[Sensor %d] Restored ref_baseline: %.2f", i, sensors_[i].ref_baseline);
+                }
+
                 sensors_[i].trap_pts.clear();
                 for(auto& pt : j["cameras"][i]["trap_src"]) {
                     sensors_[i].trap_pts.push_back(cv::Point(pt[0], pt[1]));
                 }
             }
             file.close();
+
+            RCLCPP_INFO(this->get_logger(),
+                "Config loaded. S1: k=%.4f b=%.1f | S2: k=%.4f b=%.1f | S3: k=%.4f b=%.1f",
+                sensors_[0].k_val, sensors_[0].b_val,
+                sensors_[1].k_val, sensors_[1].b_val,
+                sensors_[2].k_val, sensors_[2].b_val);
+        }
+    }
+
+    void save_config_json() {
+        std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
+        json j;
+        if (file.is_open()) { file >> j; file.close(); }
+        if (j.contains("cameras")) {
+            for (int i = 0; i < 3; ++i) {
+                if (j["cameras"].size() > (size_t)i) {
+                    j["cameras"][i]["k_slider"] = sensors_[i].k_val;
+                    j["cameras"][i]["b_slider"] = sensors_[i].b_val;
+                }
+            }
+            std::ofstream out("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
+            if (out.is_open()) { out << j.dump(4); out.close(); }
+        }
+    }
+
+    void save_ref_baseline() {
+        std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
+        json j;
+        if (file.is_open()) { file >> j; file.close(); }
+        if (j.contains("cameras")) {
+            for (int i = 0; i < 3; ++i) {
+                if (j["cameras"].size() > (size_t)i) {
+                    j["cameras"][i]["ref_baseline"] = sensors_[i].ref_baseline;
+                }
+            }
+            std::ofstream out("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
+            if (out.is_open()) { out << j.dump(4); out.close(); }
+            RCLCPP_INFO(this->get_logger(), "ref_baseline saved to config.");
         }
     }
 
@@ -199,15 +272,20 @@ private:
             std::lock_guard<std::mutex> lock(data_mutex_);
             printf("\033[H\033[J");
             printf("====================================================\n");
-            printf("         OPTIMIZED TACTILE SENSOR TRACKER TUI       \n");
+            printf("         TACTILE SENSOR TRACKER TUI                 \n");
             printf("====================================================\n");
-            printf(" Target FPS Limit: %d (Adjust via ROS Param)\n\n", global_fps_limit);
-            
+            printf(" FPS Limit: %d\n\n", global_fps_limit);
+
             for(int i=0; i<3; ++i) {
-                printf(" [Sensor %d] FPS: %5.1f | Area: %7.1f | Force: %6.2f (dF: %6.1f) | Thresh: %3d\n",
+                printf(" [Sensor %d] FPS:%5.1f | A:%7.1f | F:%7.2f gf | dF:%6.1f\n",
                        i+1, sensors_[i].current_fps, sensors_[i].last_area, sensors_[i].force,
-                       shm_ptr_[3+i], sensors_[i].thresh);
-                
+                       shm_ptr_[3+i]);
+                printf("            k=%.4f b=%.1f th=%d base_th=%d ref_bl=%.1f ref_br=%.1f warm=%d\n",
+                       sensors_[i].k_val, sensors_[i].b_val,
+                       sensors_[i].thresh, sensors_[i].base_thresh,
+                       sensors_[i].ref_baseline, sensors_[i].ref_brightness,
+                       sensors_[i].warmup_count);
+
                 if(!sensors_[i].display_img.empty()) {
                     disp_imgs[i] = sensors_[i].display_img.clone();
                 }
@@ -228,69 +306,97 @@ private:
 
     void camera_thread_func(int idx) {
         std::string source = camera_sources_[idx];
-        
+
         auto process_frame = [&](cv::Mat& frame) {
             if (frame.empty()) return;
 
             cv::UMat u_frame, u_binary;
 
             try {
-                frame.copyTo(u_frame); 
+                frame.copyTo(u_frame);
 
                 if (sensors_[idx].u_mask.empty() && !sensors_[idx].trap_pts.empty()) {
                     cv::Mat temp_mask = cv::Mat::zeros(frame.size(), CV_8UC1);
                     cv::fillConvexPoly(temp_mask, sensors_[idx].trap_pts, cv::Scalar(255));
                     temp_mask.copyTo(sensors_[idx].u_mask);
+                    sensors_[idx].mask = temp_mask.clone();
                 }
 
-                cv::threshold(u_frame, u_binary, 120, 255, cv::THRESH_BINARY);
-                
+                // ── Adaptive threshold: ref_roi brightness tracking (τ ≈ 1s) ──
+                cv::Rect roi = sensors_[idx].ref_roi;
+                if (roi.x + roi.width > frame.cols) roi.width = frame.cols - roi.x;
+                if (roi.y + roi.height > frame.rows) roi.height = frame.rows - roi.y;
+                if (roi.width > 0 && roi.height > 0) {
+                    cv::Mat ref_patch = frame(roi);
+                    double raw_ref = cv::mean(ref_patch)[0];
+                    // EMA: α ≈ 0.000278, τ ≈ 30s @120fps
+                    sensors_[idx].ref_brightness = 0.999722 * sensors_[idx].ref_brightness + 0.000278 * raw_ref;
+
+                    // warmup baseline
+                    if (sensors_[idx].ref_baseline < 0.0) {
+                        if (++sensors_[idx].warmup_count >= SensorData::WARMUP_FRAMES) {
+                            sensors_[idx].ref_baseline = sensors_[idx].ref_brightness;
+                            RCLCPP_INFO(this->get_logger(), "[Sensor %d] Warmup complete, ref_baseline=%.1f", idx, sensors_[idx].ref_baseline);
+                        }
+                    }
+                    if (sensors_[idx].ref_baseline > 0.0) {
+                        double ratio = sensors_[idx].ref_brightness / sensors_[idx].ref_baseline;
+                        sensors_[idx].thresh = (int)(sensors_[idx].base_thresh * ratio);
+                        if (sensors_[idx].thresh < 80)  sensors_[idx].thresh = 80;
+                        if (sensors_[idx].thresh > 180) sensors_[idx].thresh = 180;
+                    }
+                }
+
+                cv::threshold(u_frame, u_binary, sensors_[idx].thresh, 255, cv::THRESH_BINARY);
+
                 if (!sensors_[idx].u_mask.empty()) {
                     cv::bitwise_and(u_binary, sensors_[idx].u_mask, u_binary);
                 }
 
                 cv::Mat display_clone;
-                u_binary.copyTo(display_clone); 
+                u_binary.copyTo(display_clone);
 
                 double total_area = cv::countNonZero(u_binary);
                 double alpha = this->get_parameter("filter_alpha").as_double();
 
                 {
                     std::lock_guard<std::mutex> lock(data_mutex_);
-                    
+
                     double smoothed_area = alpha * total_area + (1.0 - alpha) * sensors_[idx].last_area;
-                    sensors_[idx].display_img = display_clone; 
-                    
+                    sensors_[idx].display_img = display_clone;
+
                     double k = sensors_[idx].k_val;
                     double b = sensors_[idx].b_val;
 
                     sensors_[idx].last_area = smoothed_area;
-                    sensors_[idx].force = (k * (smoothed_area+b));
-                } 
+                    sensors_[idx].force = k * smoothed_area + b;
+                }
 
                 u_frame.release();
                 u_binary.release();
+
+                sensors_[idx].camera_ok.store(true);
 
             } catch (const cv::Exception& e) {
-                RCLCPP_ERROR(this->get_logger(), "[Sensor %d] OpenCV Exception in process_frame: %s", idx + 1, e.what());
+                RCLCPP_ERROR(this->get_logger(), "[Sensor %d] OpenCV Exception: %s", idx + 1, e.what());
                 u_frame.release();
                 u_binary.release();
-                sensors_[idx].u_mask.release(); 
+                sensors_[idx].u_mask.release();
             } catch (const std::exception& e) {
-                RCLCPP_ERROR(this->get_logger(), "[Sensor %d] Standard Exception in process_frame: %s", idx + 1, e.what());
+                RCLCPP_ERROR(this->get_logger(), "[Sensor %d] Exception: %s", idx + 1, e.what());
             } catch (...) {
-                RCLCPP_ERROR(this->get_logger(), "[Sensor %d] Unknown Exception occurred in process_frame.", idx + 1);
+                RCLCPP_ERROR(this->get_logger(), "[Sensor %d] Unknown Exception.", idx + 1);
             }
         };
 
         if (source == "0" || source == "1") {
             std::string cmd = rpicam_cmds_[idx];
             if (cmd.empty()) {
-                cmd = "rpicam-vid -t 0 --camera " + source + 
-                      " --width 640 --height 400 --framerate 120" + 
+                cmd = "rpicam-vid -t 0 --camera " + source +
+                      " --width 640 --height 400 --framerate 120" +
                       " --codec yuv420 --denoise off --nopreview --awb daylight --shutter 20000 --gain 2.0 -o - 2>/dev/null";
             }
-            
+
             FILE* pipe = popen(cmd.c_str(), "r");
             if (!pipe) {
                 RCLCPP_ERROR(this->get_logger(), "Failed to open rpicam pipe for sensor %d", idx+1);
@@ -298,11 +404,11 @@ private:
             }
 
             int width = 640, height = 400;
-            int y_size = width * height;           
-            int frame_size = y_size * 3 / 2;       
-            
+            int y_size = width * height;
+            int frame_size = y_size * 3 / 2;
+
             std::vector<uint8_t> buffer(frame_size);
-            cv::Mat frame(height, width, CV_8UC1); 
+            cv::Mat frame(height, width, CV_8UC1);
 
             auto last_frame_time = std::chrono::steady_clock::now();
             int frame_count = 0;
@@ -337,12 +443,11 @@ private:
             std::string dev_name;
 
             if (source.find("/dev/") == 0) {
-                dev_name = source; 
+                dev_name = source;
             } else {
-                dev_name = "/dev/video" + source; 
+                dev_name = "/dev/video" + source;
             }
 
-            // [수정 1] 카메라를 먼저 엽니다. (OpenCV 초기화가 시스템 설정을 덮어쓰는 것을 방지)
             cap.open(dev_name, cv::CAP_V4L2);
             if (cap.isOpened()) {
                 cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
@@ -350,34 +455,26 @@ private:
                 cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
                 cap.set(cv::CAP_PROP_FPS, 120);
 
-                // OpenCV 내부 API로도 1차 고정 (V4L2 백엔드 기준 1이 수동)
-                cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 1); 
+                cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 1);
                 cap.set(cv::CAP_PROP_EXPOSURE, 150);
                 cap.set(cv::CAP_PROP_GAIN, 20);
             } else {
-                RCLCPP_ERROR(this->get_logger(), "Failed to find or open any USB camera (source: %s)", source.c_str());
+                RCLCPP_ERROR(this->get_logger(), "Failed to open USB camera (source: %s)", source.c_str());
                 return;
             }
 
-            // [수정 2] 하드웨어 파라미터를 강제하는 람다 함수 정의
             auto apply_camera_settings = [dev_name]() {
-                // 터미널 출력을 막기 위해 > /dev/null 2>&1 추가
                 std::string suffix = " > /dev/null 2>&1";
-                
-                // 기존 설정
                 system(("v4l2-ctl -d " + dev_name + " -c auto_exposure=1" + suffix).c_str());
                 system(("v4l2-ctl -d " + dev_name + " -c exposure_time_absolute=150" + suffix).c_str());
                 system(("v4l2-ctl -d " + dev_name + " -c gain=20" + suffix).c_str());
                 system(("v4l2-ctl -d " + dev_name + " -c white_balance_automatic=0" + suffix).c_str());
                 system(("v4l2-ctl -d " + dev_name + " -c white_balance_temperature=4600" + suffix).c_str());
-                
-                // 드리프팅을 유발하는 숨겨진 ISP 기능들 모두 Off
-                system(("v4l2-ctl -d " + dev_name + " -c backlight_compensation=0" + suffix).c_str()); // 역광 보정 끄기
-                system(("v4l2-ctl -d " + dev_name + " -c power_line_frequency=0" + suffix).c_str());   // 플리커 방지(50/60Hz) 자동조절 끄기
-                system(("v4l2-ctl -d " + dev_name + " -c exposure_dynamic_framerate=0" + suffix).c_str()); // 동적 프레임레이트 끄기
+                system(("v4l2-ctl -d " + dev_name + " -c backlight_compensation=0" + suffix).c_str());
+                system(("v4l2-ctl -d " + dev_name + " -c power_line_frequency=0" + suffix).c_str());
+                system(("v4l2-ctl -d " + dev_name + " -c exposure_dynamic_framerate=0" + suffix).c_str());
             };
 
-            // cap.open() 직후에 V4L2 명령으로 하드웨어 세팅 덮어쓰기
             apply_camera_settings();
 
             cv::Mat frame;
@@ -392,8 +489,6 @@ private:
 
                 frame_count++;
                 auto now = std::chrono::steady_clock::now();
-                
-                // FPS 계산 로직
                 double elapsed_sec = std::chrono::duration<double>(now - last_frame_time).count();
                 if (elapsed_sec >= 1.0) {
                     sensors_[idx].current_fps = frame_count / elapsed_sec;
@@ -415,9 +510,9 @@ private:
 
         connect_pose_shm();
 
-        double f1 = (sensors_[0].force);
-        double f2 = (sensors_[1].force);
-        double f3 = (sensors_[2].force);
+        double f1 = sensors_[0].force;
+        double f2 = sensors_[1].force;
+        double f3 = sensors_[2].force;
 
         rclcpp::Time current_time = this->now();
         double t_now = current_time.seconds();
@@ -441,12 +536,179 @@ private:
 
         last_time_ = current_time;
     }
+
+    friend class TrackerQtGui;
 };
 
-int main(int argc, char **argv) {
+// ─── QT5 GUI ───
+class TrackerQtGui : public QWidget {
+    Q_OBJECT
+public:
+    TrackerQtGui(TactileBallTracker* node, QWidget* parent = nullptr)
+        : QWidget(parent), node_(node)
+    {
+        setWindowTitle("Tactile Sensor Calibration");
+        auto* main_layout = new QVBoxLayout(this);
+
+        QFont bold_font;
+        bold_font.setBold(true);
+
+        // ── Live display (read-only labels) ──
+        auto* live_group = new QGroupBox("Live Sensor Data");
+        auto* live_layout = new QHBoxLayout();
+        for (int col = 0; col < 3; ++col) {
+            live_labels_[col] = new QLabel("S" + QString::number(col+1) + "\nA: ---- px\nF: ---- gf\n●");
+            live_labels_[col]->setAlignment(Qt::AlignCenter);
+            live_labels_[col]->setFont(bold_font);
+            live_labels_[col]->setStyleSheet("color: red;");
+            live_layout->addWidget(live_labels_[col]);
+        }
+        live_group->setLayout(live_layout);
+        main_layout->addWidget(live_group);
+
+        // ── 4x3 calibration grid (ALL writeable) ──
+        auto* grid_group = new QGroupBox("Calibration Data (all editable)");
+        auto* grid = new QGridLayout();
+        QStringList headers = {"Sensor 1", "Sensor 2", "Sensor 3"};
+        QStringList row_names = {"A [px]", "B [px]", "C [gf]", "Spare"};
+
+        for (int col = 0; col < 3; ++col) {
+            auto* hdr = new QLabel(headers[col]);
+            hdr->setFont(bold_font);
+            hdr->setAlignment(Qt::AlignCenter);
+            grid->addWidget(hdr, 0, col + 1);
+        }
+        for (int row = 0; row < 4; ++row) {
+            auto* lbl = new QLabel(row_names[row]);
+            lbl->setFont(bold_font);
+            grid->addWidget(lbl, row + 1, 0);
+        }
+
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 3; ++col) {
+                auto* edit = new QLineEdit("0.0");
+                edit->setAlignment(Qt::AlignRight);
+                edit->setStyleSheet("background-color: #fffff0;");
+                grid->addWidget(edit, row + 1, col + 1);
+                cells_[row][col] = edit;
+            }
+        }
+        grid_group->setLayout(grid);
+        main_layout->addWidget(grid_group);
+
+        // ── Per-sensor buttons (k calc + zero) ──
+        auto* btn_group = new QGroupBox("Per-Sensor Actions");
+        auto* btn_layout = new QHBoxLayout();
+        for (int col = 0; col < 3; ++col) {
+            auto* vbox = new QVBoxLayout();
+            auto* k_btn = new QPushButton("k 계산");
+            auto* zero_btn = new QPushButton("영점");
+            int sensor_idx = col;
+            connect(k_btn, &QPushButton::clicked, [this, sensor_idx]() { calc_k(sensor_idx); });
+            connect(zero_btn, &QPushButton::clicked, [this, sensor_idx]() { set_zero(sensor_idx); });
+            vbox->addWidget(new QLabel("Sensor " + QString::number(col+1)));
+            vbox->addWidget(k_btn);
+            vbox->addWidget(zero_btn);
+            btn_layout->addLayout(vbox);
+        }
+        btn_group->setLayout(btn_layout);
+        main_layout->addWidget(btn_group);
+
+        // ── Baseline adjust buttons ──
+        auto* base_group = new QGroupBox("Baseline Adjust (ref_baseline, all sensors)");
+        auto* base_layout = new QHBoxLayout();
+        auto add_base_btn = [&](int delta) {
+            auto* btn = new QPushButton((delta > 0 ? "+" : "") + QString::number(delta));
+            connect(btn, &QPushButton::clicked, [this, delta]() {
+                for (int i = 0; i < 3; ++i)
+                    node_->adjust_baseline(i, delta);
+            });
+            return btn;
+        };
+        base_layout->addWidget(add_base_btn(10));
+        base_layout->addWidget(add_base_btn(1));
+        base_layout->addWidget(add_base_btn(-1));
+        base_layout->addWidget(add_base_btn(-10));
+        base_group->setLayout(base_layout);
+        main_layout->addWidget(base_group);
+
+        // ── Refresh timer (10 Hz) ──
+        auto* refresh_timer = new QTimer(this);
+        connect(refresh_timer, &QTimer::timeout, this, &TrackerQtGui::refresh_display);
+        refresh_timer->start(100);
+
+        setMinimumWidth(550);
+    }
+
+private slots:
+    void refresh_display() {
+        auto* s = node_->sensors();
+        std::lock_guard<std::mutex> lock(node_->data_mutex());
+
+        for (int col = 0; col < 3; ++col) {
+            double a = s[col].last_area;
+            double force_val = s[col].k_val * a + s[col].b_val;
+            bool ok = s[col].camera_ok.load();
+
+            live_labels_[col]->setText(
+                "S" + QString::number(col+1) +
+                "\nA: " + QString::number(a, 'f', 1) + " px" +
+                "\nF: " + QString::number(force_val, 'f', 2) + " gf" +
+                "\n" + (ok ? "●" : "○"));
+            live_labels_[col]->setStyleSheet(
+                ok ? "color: green; font-weight: bold;" : "color: red; font-weight: bold;");
+        }
+    }
+
+    void calc_k(int idx) {
+        double a = cells_[0][idx]->text().toDouble();
+        double b = cells_[1][idx]->text().toDouble();
+        double c = cells_[2][idx]->text().toDouble();
+        double denom = b - a;
+        if (std::abs(denom) > 1.0) {
+            double new_k = c / denom;
+            node_->set_k(idx, new_k);
+        }
+    }
+
+    void set_zero(int idx) {
+        node_->set_zero(idx);
+    }
+
+private:
+    TactileBallTracker* node_;
+    QLineEdit* cells_[4][3];   // [row][col]: 0=A, 1=B, 2=C, 3=Spare  (all writeable)
+    QLabel* live_labels_[3];   // live display labels
+};
+
+// ─── Qt main ───
+static TrackerQtGui* g_gui = nullptr;
+
+int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
+
+    // Qt application (must be created before node for signal handling)
+    QApplication app(argc, argv);
+
     auto node = std::make_shared<TactileBallTracker>();
-    rclcpp::spin(node);
+
+    bool show_qt = node->get_parameter("show_qt_gui").as_bool();
+    if (show_qt) {
+        g_gui = new TrackerQtGui(node.get());
+        g_gui->show();
+    }
+
+    // ROS spin in separate thread, Qt event loop in main
+    std::thread spin_thread([&node]() {
+        rclcpp::spin(node);
+    });
+
+    int ret = app.exec();
+
     rclcpp::shutdown();
-    return 0;
+    if (spin_thread.joinable()) spin_thread.join();
+
+    return ret;
 }
+
+#include "tactile_ball_tracker_debug.moc"

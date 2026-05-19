@@ -15,6 +15,9 @@ def generate_launch_description():
     show_gui_arg = DeclareLaunchArgument('show_gui', default_value='false')
     show_gui = LaunchConfiguration('show_gui')
 
+    show_qt_gui_arg = DeclareLaunchArgument('show_qt_gui', default_value='true')
+    show_qt_gui = LaunchConfiguration('show_qt_gui')
+
     # 1. Robot State Publisher
     robot_state_publisher = Node(
         package='robot_state_publisher',
@@ -39,18 +42,19 @@ def generate_launch_description():
         package=pkg_name,
         executable='tactile_ball_tracker_debug',
         name='ball_tracker_node',
-        parameters=[{'show_gui': show_gui}]
+        parameters=[{'show_gui': show_gui, 'show_qt_gui': show_qt_gui, 'fps_limit': 100}]
     )
 
     balance_controller = Node(
         package=pkg_name,
         executable='balance_controller.py',
         name='balance_controller',
-        parameters=[{'show_gui': show_gui, 'fps_limit': 100}]
+        parameters=[{'show_gui': show_gui}]
     )
 
     return LaunchDescription([
         show_gui_arg,
+        show_qt_gui_arg,
         robot_state_publisher,
         dynamixel_node,
         ball_tracker_node,
