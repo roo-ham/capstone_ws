@@ -13,7 +13,7 @@ import json
 import csv
 import cv2  # OpenCV 추가
 
-F_TOTAL_MIN = 10
+F_TOTAL_MIN = 5
 PLATE_MASS = 0.2347  # kg
 N_TO_GF = 101.97162
 
@@ -83,6 +83,7 @@ class BallBalancingNode(Node):
         # 기본 게인 초기화
         self.Kp_ball = 5.0
         self.Kd_ball = 0.5
+        self.Ki_ball = 0.0
         self.detection_quality = 0.0  # EMA of ball detection confidence
         # Energy/tuning params for detection quality EMA
         self.detq_offset = 5.0      # f_total offset subtracted
@@ -121,7 +122,8 @@ class BallBalancingNode(Node):
         self.shutdown_flag = False
         self.pause_control()
 
-        self.f_err_prev = None
+        self.acts = None
+        self.f_integral = np.zeros(3)
 
     def load_force_coeffs(self):
         defaults = np.array([
@@ -191,6 +193,7 @@ class BallBalancingNode(Node):
                     
                     self.Kp_ball = cfg.get('Kp_ball', self.Kp_ball)
                     self.Kd_ball = cfg.get('Kd_ball', self.Kd_ball)
+                    self.Ki_ball = cfg.get('Ki_ball', self.Ki_ball)
                     self.detq_offset = cfg.get('detq_offset', self.detq_offset)
                     self.detq_scale = cfg.get('detq_scale', self.detq_scale)
                     self.detq_attack = cfg.get('detq_attack', self.detq_attack)
@@ -211,6 +214,7 @@ class BallBalancingNode(Node):
             'pitch_offset_rad': self.pitch_offset_rad,
             'Kp_ball': self.Kp_ball,
             'Kd_ball': self.Kd_ball,
+            'Ki_ball': self.Ki_ball,
             'detq_offset': self.detq_offset,
             'detq_scale': self.detq_scale,
             'detq_attack': self.detq_attack,
@@ -242,13 +246,14 @@ class BallBalancingNode(Node):
 
     def resume_control(self):
         self.is_paused = False
+        self.f_integral = np.zeros(3)
 
     def connect_shared_memory(self):
         if not self.shm_connected_ball:
             try:
                 if self.shm_ball is None:
                     self.shm_ball = shared_memory.SharedMemory(name='ball_state_shm')
-                    self.ball_state_array = np.ndarray((4,), dtype=np.float64, buffer=self.shm_ball.buf)
+                    self.ball_state_array = np.ndarray((7,), dtype=np.float64, buffer=self.shm_ball.buf)
                 self.shm_connected_ball = True
             except FileNotFoundError:
                 pass
@@ -293,9 +298,10 @@ class BallBalancingNode(Node):
             return
 
         try:
-            # --- 1. 원시 힘 데이터 읽기 ---
+            # --- 1. 원시 힘 + 미분 데이터 읽기 (SHM: f1,f2,f3,df1,df2,df3,timestamp) ---
             curr_raw = np.array(self.ball_state_array)
-            self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw, _ = curr_raw
+            self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw = curr_raw[0:3]
+            df_raw = curr_raw[3:6]  # df from tracker (raw force derivative)
 
             # --- 2. 손가락 Z속도(global frame) 평균 → 게인 스케줄링용 ---
             if self.eef_dot_array is not None:
@@ -358,47 +364,44 @@ class BallBalancingNode(Node):
             self.ball_detected = (f_total >= F_TOTAL_MIN)
             self.prev_ball_detected = self.ball_detected or self.prev_ball_detected
 
-            # --- Detection quality: EMA of f_total (fast attack, slow decay, never stuck) ---
+            # --- Detection quality: EMA of f_total (fast attack, slow decay) ---
             target_q = np.clip((f_total - self.detq_offset) / self.detq_scale, 0.0, 1.0)
             alpha_q = self.detq_attack if target_q < self.detection_quality else self.detq_recovery
             self.detection_quality += alpha_q * (target_q - self.detection_quality)
 
-            # --- 7. PD 제어 + Z속도 + detection quality ---
-            z_vel_mag = abs(self.z_vel_filt)
-            if z_vel_mag > 0.01:
-                gain_scale = max(0.15, 1.0 - z_vel_mag / 0.05)
-            else:
-                gain_scale = 1.0
-
-            Kp_active = self.Kp_ball * gain_scale * self.detection_quality
-            Kd_active = self.Kd_ball * gain_scale * self.detection_quality
-
+            # --- 7. Force-based PD 제어 + dead band ---
             cmd_tilt = np.zeros(2)
 
-            FORCE_BIAS = 15
-            DEAD_BAND = 15
-            f_err = np.array([self.curr_f1_res, self.curr_f2_res, self.curr_f3_res]) - FORCE_BIAS
-            mask = np.abs(f_err) > DEAD_BAND
-            f_err = np.where(mask, f_err - np.sign(f_err) * DEAD_BAND, 0.0)
-            if not self.f_err_prev is None:
-                df_err = (f_err - self.f_err_prev) / dt
-            else:
-                df_err = np.zeros_like(f_err)
-                self.f_err_prev = f_err.copy()
+            FORCE_BIAS = 50
+            DEAD_BAND = 0.01  # temporarily disabled for data collection
 
-            f_vz = np.array([f1_vz, f2_vz, f3_vz])
+            
+            f_err = np.array([self.curr_f1_res - np.degrees(cmd_tilt[1]) + 3.21,
+                              self.curr_f2_res - np.degrees(cmd_tilt[1]) + 2.76,
+                              self.curr_f3_res - np.degrees(cmd_tilt[0]) * 3.2163 + np.degrees(cmd_tilt[1]) * 0.57]) - FORCE_BIAS
+
+            mask = np.abs(df_raw) > DEAD_BAND
+            df_deadband = np.where(mask, df_raw - np.sign(df_raw) * DEAD_BAND, 0.0) 
+            
+            # f_vz = np.array([f1_vz, f2_vz, f3_vz])
+
             dirs = np.array([[0.7, -0.7], [-0.7, -0.7], [0.0, 1.0]])
-            acts = dirs * (self.Kp_ball * f_err[:, None] + self.Kd_ball * df_err[:, None])
-            act_1, act_2, act_3 = acts[0], acts[1], acts[2]
+            # new_acts = dirs * (self.Kp_ball * f_err[:, None] + self.Kd_ball * df_covar[:, None])
+            acts_no_filter = dirs * (self.Kp_ball * f_err[:, None] + self.Ki_ball * self.f_integral[:, None])
+            # 양수면 멀어지고 음수면 가까이 오는 식
+
+            INTEGRAL_MAX = 50.0
+            self.f_integral = np.clip(self.f_integral + f_err * self.dt, -INTEGRAL_MAX, INTEGRAL_MAX)
 
 
-            # if not self.is_paused and self.detection_quality > 0.1:
-            #     err_x = self.target_ball_x - self.curr_ball_x
-            #     err_y = self.target_ball_y - self.curr_ball_y
-            #     cmd_tilt[0] = Kp_active * err_x + Kd_active * (0.0 - self.curr_ball_vx)
-            #     cmd_tilt[1] = Kp_active * err_y + Kd_active * (0.0 - self.curr_ball_vy)
+            TAU = 0.001
+            new_acts = dirs * self.Kd_ball * df_deadband[:, None]
+            if self.acts is None:
+                self.acts = new_acts
+            self.acts = (1 - TAU) * self.acts + 1.000 * TAU * new_acts
+            act_1, act_2, act_3 = self.acts + acts_no_filter
 
-            if not self.is_paused:
+            if (not self.is_paused) and self.ball_detected:
                 cmd_tilt = (act_1 + act_2 + act_3) / 3
 
             cmd_tilt = np.clip(cmd_tilt, -self.MAX_TILT_RAD, self.MAX_TILT_RAD)
@@ -420,7 +423,10 @@ class BallBalancingNode(Node):
                 self.curr_f1_res, self.curr_f2_res, self.curr_f3_res,
                 f1_exp, f2_exp, f3_exp,
                 self.curr_ball_x, self.curr_ball_y, self.curr_ball_vx, self.curr_ball_vy,
-                self.z_vel_filt, gain_scale,
+                self.z_vel_filt, avg_eef_x, avg_eef_y,
+                f_err[0], f_err[1], f_err[2],
+                self.f_integral[0], self.f_integral[1], self.f_integral[2],
+                df_raw[0], df_raw[1], df_raw[2],
                 self.target_data[2], self.target_data[5], self.target_data[6],
                 cop_x_raw, cop_y_raw, f_total,
                 bx, by,  # raw CoP before Kalman
@@ -487,20 +493,26 @@ class TuningUI:
         self.lbl_eef_force.pack(anchor='w', pady=2)
 
         # --- [Left] 독립형 볼 제어 파라미터 (PD) ---
-        pd_frame = ttk.LabelFrame(left_col, text=" Ball Controller (PD) ", padding=5)
+        pd_frame = ttk.LabelFrame(left_col, text=" Ball Controller (PID) ", padding=5)
         pd_frame.pack(fill='x', pady=5)
 
         self.lbl_kp_ball = ttk.Label(pd_frame, text=f"Kp_ball: {self.node.Kp_ball:.3f}", width=20)
         self.lbl_kp_ball.pack(anchor='w')
-        self.sl_kp_ball = ttk.Scale(pd_frame, from_=-0.1, to=0.1, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
+        self.sl_kp_ball = ttk.Scale(pd_frame, from_=0, to=0.02, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
         self.sl_kp_ball.set(self.node.Kp_ball)
         self.sl_kp_ball.pack(fill='x', expand=True, pady=(0,5))
 
         self.lbl_kd_ball = ttk.Label(pd_frame, text=f"Kd_ball: {self.node.Kd_ball:.3f}", width=20)
         self.lbl_kd_ball.pack(anchor='w')
-        self.sl_kd_ball = ttk.Scale(pd_frame, from_=-5.0, to=5.0, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
+        self.sl_kd_ball = ttk.Scale(pd_frame, from_=0, to=0.1, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
         self.sl_kd_ball.set(self.node.Kd_ball)
-        self.sl_kd_ball.pack(fill='x', expand=True)
+        self.sl_kd_ball.pack(fill='x', expand=True, pady=(0,5))
+
+        self.lbl_ki_ball = ttk.Label(pd_frame, text=f"Ki_ball: {self.node.Ki_ball:.5f}", width=20)
+        self.lbl_ki_ball.pack(anchor='w')
+        self.sl_ki_ball = ttk.Scale(pd_frame, from_=0, to=0.01, orient='horizontal', command=lambda v: self.update_ball_gain("Ki", v))
+        self.sl_ki_ball.set(self.node.Ki_ball)
+        self.sl_ki_ball.pack(fill='x', expand=True)
 
         # --- [Left] Detection Quality (Energy) Params ---
         detq_frame = ttk.LabelFrame(left_col, text=" Detection Quality (DetQ) Params ", padding=5)
@@ -536,7 +548,7 @@ class TuningUI:
 
         self.lbl_max_tilt = ttk.Label(limit_frame, text=f"Max Tilt Angle: {self.node.max_tilt_deg:.1f} deg", width=30)
         self.lbl_max_tilt.pack(anchor='w')
-        self.sl_max_tilt = ttk.Scale(limit_frame, from_=1.0, to=15.0, orient='horizontal', command=self.update_max_tilt)
+        self.sl_max_tilt = ttk.Scale(limit_frame, from_=1.0, to=20.0, orient='horizontal', command=self.update_max_tilt)
         self.sl_max_tilt.set(self.node.max_tilt_deg)
         self.sl_max_tilt.pack(fill='x', expand=True)
 
@@ -581,13 +593,13 @@ class TuningUI:
 
         self.lbl_roll_offset = ttk.Label(offset_frame, text=f"Roll Offset: {np.degrees(self.node.roll_offset_rad):>7.3f}", style="Data.TLabel", width=25)
         self.lbl_roll_offset.pack(anchor='w')
-        self.slider_roll_offset = ttk.Scale(offset_frame, from_=-10.0, to=10.0, orient='horizontal', command=lambda val: self.update_offset_value("roll", val))
+        self.slider_roll_offset = ttk.Scale(offset_frame, from_=-20.0, to=20.0, orient='horizontal', command=lambda val: self.update_offset_value("roll", val))
         self.slider_roll_offset.set(np.degrees(self.node.roll_offset_rad))
         self.slider_roll_offset.pack(fill='x')
 
         self.lbl_pitch_offset = ttk.Label(offset_frame, text=f"Pitch Offset: {np.degrees(self.node.pitch_offset_rad):>7.3f}", style="Data.TLabel", width=25)
         self.lbl_pitch_offset.pack(anchor='w')
-        self.slider_pitch_offset = ttk.Scale(offset_frame, from_=-10.0, to=10.0, orient='horizontal', command=lambda val: self.update_offset_value("pitch", val))
+        self.slider_pitch_offset = ttk.Scale(offset_frame, from_=-20.0, to=20.0, orient='horizontal', command=lambda val: self.update_offset_value("pitch", val))
         self.slider_pitch_offset.set(np.degrees(self.node.pitch_offset_rad))
         self.slider_pitch_offset.pack(fill='x')
 
@@ -640,6 +652,7 @@ class TuningUI:
         self.node.load_config()
         self.sl_kp_ball.set(self.node.Kp_ball)
         self.sl_kd_ball.set(self.node.Kd_ball)
+        self.sl_ki_ball.set(self.node.Ki_ball)
         self.sl_max_tilt.set(self.node.max_tilt_deg)
         self.slider_roll_offset.set(np.degrees(self.node.roll_offset_rad))
         self.slider_pitch_offset.set(np.degrees(self.node.pitch_offset_rad))
@@ -669,6 +682,9 @@ class TuningUI:
         elif name == "Kd":
             self.node.Kd_ball = val
             self.lbl_kd_ball.config(text=f"Kd_ball: {val:.3f}")
+        elif name == "Ki":
+            self.node.Ki_ball = val
+            self.lbl_ki_ball.config(text=f"Ki_ball: {val:.5f}")
 
     def update_max_tilt(self, value):
         val = float(value)
@@ -815,7 +831,10 @@ def main(args=None):
                         'f1_res', 'f2_res', 'f3_res',
                         'f1_exp', 'f2_exp', 'f3_exp',
                         'ball_x', 'ball_y', 'ball_vx', 'ball_vy',
-                        'z_vel_filt', 'gain_scale',
+                        'z_vel_filt', 'eef_centroid_x', 'eef_centroid_y',
+                        'f_err1', 'f_err2', 'f_err3',
+                        'f_int1', 'f_int2', 'f_int3',
+                        'df_err1', 'df_err2', 'df_err3',
                         'xyz_des_z', 'K_task', 'D_task',
                         'cop_x_raw', 'cop_y_raw', 'f_total',
                         'cop_x_meas', 'cop_y_meas', 'detection_quality', 'kf_P_trace',

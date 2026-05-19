@@ -46,7 +46,7 @@ def generate_launch_description():
         package=pkg_name,
         executable='balance_controller.py',
         name='balance_controller',
-        parameters=[{'show_gui': show_gui}]
+        parameters=[{'show_gui': show_gui, 'fps_limit': 100}]
     )
 
     return LaunchDescription([

@@ -1,8 +1,8 @@
 {
     "cameras": [
         {
-            "b_slider": -3638.0,
-            "k_slider": 0.03361306552070463,
+            "b_slider": -3084.0,
+            "k_slider": 0.02561306552070463,
             "ref_baseline": 92.11040530202561,
             "ref_brightness": 90.7167186394598,
             "ref_roi": [
@@ -34,9 +34,9 @@
             "zero_area": 0.0
         },
         {
-            "b_slider": -92969.0,
-            "k_slider": 0.006268173239126069,
-            "ref_baseline": 228.71592706282829,
+            "b_slider": -87418.0,
+            "k_slider": 0.004068173239126069,
+            "ref_baseline": 60.71592706282829,
             "ref_brightness": 228.11321326665814,
             "ref_roi": [
                 5,
@@ -66,8 +66,8 @@
             "zero_area": 0.0
         },
         {
-            "b_slider": -1941.0,
-            "k_slider": 0.0431746635079126,
+            "b_slider": -2417.0,
+            "k_slider": 0.071746635079126,
             "ref_baseline": 90.04914842273269,
             "ref_brightness": 87.52357161525445,
             "ref_roi": [

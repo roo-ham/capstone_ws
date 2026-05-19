@@ -24,7 +24,7 @@ struct SensorData {
     
     double k_val = 100.0; 
     double b_val = 100.0; 
-    int target_fps = 150; 
+    int target_fps = 60;
     
     std::vector<cv::Point> trap_pts; 
     cv::Mat mask;                    
@@ -44,7 +44,7 @@ public:
         load_config();
         init_shm();
         
-        this->declare_parameter("fps_limit", 150);
+        this->declare_parameter("fps_limit", 60);
         this->declare_parameter("filter_alpha", 1.0);
         this->declare_parameter("show_gui", true);
 
@@ -99,7 +99,7 @@ public:
             if (th.joinable()) th.join();
         }
 
-        munmap(shm_ptr_, 4 * sizeof(double));
+        munmap(shm_ptr_, 7 * sizeof(double));
         close(fd_shm_);
         shm_unlink("ball_state_shm");
 
@@ -131,14 +131,16 @@ private:
     bool show_gui_ = true;
 
     rclcpp::Time last_time_;
+    double prev_f1 = 0.0, prev_f2 = 0.0, prev_f3 = 0.0;
+    double prev_force_time_ = 0.0;
 
     void init_shm() {
         shm_unlink("ball_state_shm");
         fd_shm_ = shm_open("ball_state_shm", O_CREAT | O_RDWR, 0666);
         
-        ftruncate(fd_shm_, 4 * sizeof(double));
-        shm_ptr_ = (double*)mmap(0, 4 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_shm_, 0);
-        std::fill(shm_ptr_, shm_ptr_ + 4, 0.0);
+        ftruncate(fd_shm_, 7 * sizeof(double));
+        shm_ptr_ = (double*)mmap(0, 7 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_shm_, 0);
+        std::fill(shm_ptr_, shm_ptr_ + 7, 0.0);
 
         connect_pose_shm();
     }
@@ -202,8 +204,9 @@ private:
             printf(" Target FPS Limit: %d (Adjust via ROS Param)\n\n", global_fps_limit);
             
             for(int i=0; i<3; ++i) {
-                printf(" [Sensor %d] FPS: %5.1f | Area: %7.1f | Force: %6.2f | Thresh: %3d\n",
-                       i+1, sensors_[i].current_fps, sensors_[i].last_area, sensors_[i].force, sensors_[i].thresh);
+                printf(" [Sensor %d] FPS: %5.1f | Area: %7.1f | Force: %6.2f (dF: %6.1f) | Thresh: %3d\n",
+                       i+1, sensors_[i].current_fps, sensors_[i].last_area, sensors_[i].force,
+                       shm_ptr_[3+i], sensors_[i].thresh);
                 
                 if(!sensors_[i].display_img.empty()) {
                     disp_imgs[i] = sensors_[i].display_img.clone();
@@ -410,20 +413,31 @@ private:
     void calculate_and_publish() {
         std::lock_guard<std::mutex> lock(data_mutex_);
 
-        connect_pose_shm(); 
+        connect_pose_shm();
 
         double f1 = (sensors_[0].force);
         double f2 = (sensors_[1].force);
         double f3 = (sensors_[2].force);
 
         rclcpp::Time current_time = this->now();
-        double dt = (current_time - last_time_).seconds();
-        if (dt <= 0) dt = 0.01;
+        double t_now = current_time.seconds();
+        double force_dt = (prev_force_time_ > 0.0) ? (t_now - prev_force_time_) : (1.0 / 60.0);
+        if (force_dt <= 0.0) force_dt = 1.0 / 60.0;
+
+        double df1 = (f1 - prev_f1) / force_dt;
+        double df2 = (f2 - prev_f2) / force_dt;
+        double df3 = (f3 - prev_f3) / force_dt;
+
+        prev_f1 = f1; prev_f2 = f2; prev_f3 = f3;
+        prev_force_time_ = t_now;
 
         shm_ptr_[0] = f1;
         shm_ptr_[1] = f2;
         shm_ptr_[2] = f3;
-        shm_ptr_[3] = current_time.seconds(); 
+        shm_ptr_[3] = df1;
+        shm_ptr_[4] = df2;
+        shm_ptr_[5] = df3;
+        shm_ptr_[6] = current_time.seconds();
 
         last_time_ = current_time;
     }
