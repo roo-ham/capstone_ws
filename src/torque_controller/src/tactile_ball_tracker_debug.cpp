@@ -98,7 +98,11 @@ public:
         }
 
         // Save ref_baseline to JSON
-        save_ref_baseline();
+        {
+            double bl_vals[3];
+            for (int i = 0; i < 3; ++i) bl_vals[i] = sensors_[i].ref_baseline;
+            save_ref_baseline(bl_vals);
+        }
 
         munmap(shm_ptr_, 7 * sizeof(double));
         close(fd_shm_);
@@ -118,25 +122,46 @@ public:
     std::mutex& data_mutex() { return data_mutex_; }
 
     void set_k(int idx, double new_k) {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        sensors_[idx].k_val = new_k;
-        save_config_json();
+        double k_vals[3], b_vals[3];
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            sensors_[idx].k_val = new_k;
+            for (int i = 0; i < 3; ++i) {
+                k_vals[i] = sensors_[i].k_val;
+                b_vals[i] = sensors_[i].b_val;
+            }
+        }
+        save_config_json(k_vals, b_vals);
         RCLCPP_INFO(this->get_logger(), "Sensor %d: k = %.6f", idx+1, new_k);
     }
 
     void set_zero(int idx) {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        double a = sensors_[idx].last_area;
-        sensors_[idx].b_val = -(sensors_[idx].k_val * a);
-        save_config_json();
-        RCLCPP_INFO(this->get_logger(), "Sensor %d: zeroed, b = -k*A = %.2f (A=%.1f)", idx+1, sensors_[idx].b_val, a);
+        double k_vals[3], b_vals[3];
+        double b_new;
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            double a = sensors_[idx].last_area;
+            sensors_[idx].b_val = -(sensors_[idx].k_val * a);
+            b_new = sensors_[idx].b_val;
+            for (int i = 0; i < 3; ++i) {
+                k_vals[i] = sensors_[i].k_val;
+                b_vals[i] = sensors_[i].b_val;
+            }
+            RCLCPP_INFO(this->get_logger(), "Sensor %d: zeroed, b = -k*A = %.2f (A=%.1f)", idx+1, b_new, a);
+        }
+        save_config_json(k_vals, b_vals);
     }
 
     void adjust_baseline(int idx, int delta) {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        sensors_[idx].ref_baseline += (double)delta;
-        if (sensors_[idx].ref_baseline < 1.0) sensors_[idx].ref_baseline = 1.0;
-        RCLCPP_INFO(this->get_logger(), "Sensor %d: ref_baseline += %d → %.1f", idx+1, delta, sensors_[idx].ref_baseline);
+        double bl_vals[3];
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            sensors_[idx].ref_baseline += (double)delta;
+            if (sensors_[idx].ref_baseline < 1.0) sensors_[idx].ref_baseline = 1.0;
+            for (int i = 0; i < 3; ++i) bl_vals[i] = sensors_[i].ref_baseline;
+            RCLCPP_INFO(this->get_logger(), "Sensor %d: ref_baseline += %d → %.1f", idx+1, delta, sensors_[idx].ref_baseline);
+        }
+        save_ref_baseline(bl_vals);
     }
 
 private:
@@ -229,15 +254,15 @@ private:
         }
     }
 
-    void save_config_json() {
+    void save_config_json(const double k_vals[3], const double b_vals[3]) {
         std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
         json j;
         if (file.is_open()) { file >> j; file.close(); }
         if (j.contains("cameras")) {
             for (int i = 0; i < 3; ++i) {
                 if (j["cameras"].size() > (size_t)i) {
-                    j["cameras"][i]["k_slider"] = sensors_[i].k_val;
-                    j["cameras"][i]["b_slider"] = sensors_[i].b_val;
+                    j["cameras"][i]["k_slider"] = k_vals[i];
+                    j["cameras"][i]["b_slider"] = b_vals[i];
                 }
             }
             std::ofstream out("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
@@ -245,14 +270,14 @@ private:
         }
     }
 
-    void save_ref_baseline() {
+    void save_ref_baseline(const double bl_vals[3]) {
         std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
         json j;
         if (file.is_open()) { file >> j; file.close(); }
         if (j.contains("cameras")) {
             for (int i = 0; i < 3; ++i) {
                 if (j["cameras"].size() > (size_t)i) {
-                    j["cameras"][i]["ref_baseline"] = sensors_[i].ref_baseline;
+                    j["cameras"][i]["ref_baseline"] = bl_vals[i];
                 }
             }
             std::ofstream out("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
@@ -287,7 +312,7 @@ private:
                        sensors_[i].warmup_count);
 
                 if(!sensors_[i].display_img.empty()) {
-                    disp_imgs[i] = sensors_[i].display_img.clone();
+                    disp_imgs[i] = sensors_[i].display_img;  // ref-counted, no deep copy
                 }
             }
             printf("====================================================\n");
@@ -306,6 +331,7 @@ private:
 
     void camera_thread_func(int idx) {
         std::string source = camera_sources_[idx];
+        cv::Mat display_clone_;  // reused across frames (no per-frame allocation)
 
         auto process_frame = [&](cv::Mat& frame) {
             if (frame.empty()) return;
@@ -353,17 +379,16 @@ private:
                     cv::bitwise_and(u_binary, sensors_[idx].u_mask, u_binary);
                 }
 
-                cv::Mat display_clone;
-                u_binary.copyTo(display_clone);
+                u_binary.copyTo(display_clone_);
 
-                double total_area = cv::countNonZero(u_binary);
+                double total_area = cv::countNonZero(display_clone_);
                 double alpha = this->get_parameter("filter_alpha").as_double();
 
                 {
                     std::lock_guard<std::mutex> lock(data_mutex_);
 
                     double smoothed_area = alpha * total_area + (1.0 - alpha) * sensors_[idx].last_area;
-                    sensors_[idx].display_img = display_clone;
+                    sensors_[idx].display_img = display_clone_;
 
                     double k = sensors_[idx].k_val;
                     double b = sensors_[idx].b_val;
@@ -566,11 +591,11 @@ public:
         live_group->setLayout(live_layout);
         main_layout->addWidget(live_group);
 
-        // ── 4x3 calibration grid (ALL writeable) ──
+        // ── 3x3 calibration grid (ALL writeable) ──
         auto* grid_group = new QGroupBox("Calibration Data (all editable)");
         auto* grid = new QGridLayout();
         QStringList headers = {"Sensor 1", "Sensor 2", "Sensor 3"};
-        QStringList row_names = {"A [px]", "B [px]", "C [gf]", "Spare"};
+        QStringList row_names = {"A [px]", "B [px]", "C [gf]"};
 
         for (int col = 0; col < 3; ++col) {
             auto* hdr = new QLabel(headers[col]);
@@ -578,13 +603,13 @@ public:
             hdr->setAlignment(Qt::AlignCenter);
             grid->addWidget(hdr, 0, col + 1);
         }
-        for (int row = 0; row < 4; ++row) {
+        for (int row = 0; row < 3; ++row) {
             auto* lbl = new QLabel(row_names[row]);
             lbl->setFont(bold_font);
             grid->addWidget(lbl, row + 1, 0);
         }
 
-        for (int row = 0; row < 4; ++row) {
+        for (int row = 0; row < 3; ++row) {
             for (int col = 0; col < 3; ++col) {
                 auto* edit = new QLineEdit("0.0");
                 edit->setAlignment(Qt::AlignRight);
@@ -596,7 +621,7 @@ public:
         grid_group->setLayout(grid);
         main_layout->addWidget(grid_group);
 
-        // ── Per-sensor buttons (k calc + zero) ──
+        // ── Per-sensor buttons (k calc + zero + baseline adjust) ──
         auto* btn_group = new QGroupBox("Per-Sensor Actions");
         auto* btn_layout = new QHBoxLayout();
         for (int col = 0; col < 3; ++col) {
@@ -604,33 +629,38 @@ public:
             auto* k_btn = new QPushButton("k 계산");
             auto* zero_btn = new QPushButton("영점");
             int sensor_idx = col;
+
             connect(k_btn, &QPushButton::clicked, [this, sensor_idx]() { calc_k(sensor_idx); });
             connect(zero_btn, &QPushButton::clicked, [this, sensor_idx]() { set_zero(sensor_idx); });
+
+            auto* base_label = new QLabel("baseline");
+            base_label->setAlignment(Qt::AlignCenter);
+
+            auto* base_hbox = new QHBoxLayout();
+            auto* bp10 = new QPushButton("+10");
+            auto* bp1  = new QPushButton("+1");
+            auto* bm1  = new QPushButton("-1");
+            auto* bm10 = new QPushButton("-10");
+
+            connect(bp10, &QPushButton::clicked, [this, sensor_idx]() { node_->adjust_baseline(sensor_idx, 10); });
+            connect(bp1,  &QPushButton::clicked, [this, sensor_idx]() { node_->adjust_baseline(sensor_idx, 1); });
+            connect(bm1,  &QPushButton::clicked, [this, sensor_idx]() { node_->adjust_baseline(sensor_idx, -1); });
+            connect(bm10, &QPushButton::clicked, [this, sensor_idx]() { node_->adjust_baseline(sensor_idx, -10); });
+
+            base_hbox->addWidget(bp10);
+            base_hbox->addWidget(bp1);
+            base_hbox->addWidget(bm1);
+            base_hbox->addWidget(bm10);
+
             vbox->addWidget(new QLabel("Sensor " + QString::number(col+1)));
             vbox->addWidget(k_btn);
             vbox->addWidget(zero_btn);
+            vbox->addWidget(base_label);
+            vbox->addLayout(base_hbox);
             btn_layout->addLayout(vbox);
         }
         btn_group->setLayout(btn_layout);
         main_layout->addWidget(btn_group);
-
-        // ── Baseline adjust buttons ──
-        auto* base_group = new QGroupBox("Baseline Adjust (ref_baseline, all sensors)");
-        auto* base_layout = new QHBoxLayout();
-        auto add_base_btn = [&](int delta) {
-            auto* btn = new QPushButton((delta > 0 ? "+" : "") + QString::number(delta));
-            connect(btn, &QPushButton::clicked, [this, delta]() {
-                for (int i = 0; i < 3; ++i)
-                    node_->adjust_baseline(i, delta);
-            });
-            return btn;
-        };
-        base_layout->addWidget(add_base_btn(10));
-        base_layout->addWidget(add_base_btn(1));
-        base_layout->addWidget(add_base_btn(-1));
-        base_layout->addWidget(add_base_btn(-10));
-        base_group->setLayout(base_layout);
-        main_layout->addWidget(base_group);
 
         // ── Refresh timer (10 Hz) ──
         auto* refresh_timer = new QTimer(this);
@@ -654,6 +684,7 @@ private slots:
                 "S" + QString::number(col+1) +
                 "\nA: " + QString::number(a, 'f', 1) + " px" +
                 "\nF: " + QString::number(force_val, 'f', 2) + " gf" +
+                "\nbl: " + QString::number(s[col].ref_baseline, 'f', 1) +
                 "\n" + (ok ? "●" : "○"));
             live_labels_[col]->setStyleSheet(
                 ok ? "color: green; font-weight: bold;" : "color: red; font-weight: bold;");
@@ -677,7 +708,7 @@ private slots:
 
 private:
     TactileBallTracker* node_;
-    QLineEdit* cells_[4][3];   // [row][col]: 0=A, 1=B, 2=C, 3=Spare  (all writeable)
+    QLineEdit* cells_[3][3];   // [row][col]: 0=A, 1=B, 2=C  (all writeable)
     QLabel* live_labels_[3];   // live display labels
 };
 

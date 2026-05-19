@@ -11,6 +11,7 @@ import os
 import json
 import csv
 import cv2  # OpenCV 추가
+from kalman_filter import BallKalmanFilter
 
 F_TOTAL_MIN = 5
 PLATE_MASS = 234.7  # gf
@@ -38,7 +39,9 @@ class BallBalancingNode(Node):
         self.eef_force_array = None
         self.shm_eef_vel = None
         self.eef_vel_array = None
-        
+        self.shm_spring_err = None
+        self.spring_err_array = None
+
         self.shm_connected_ball = False
         self.shm_connected_pose = False
 
@@ -47,9 +50,10 @@ class BallBalancingNode(Node):
         self.ball_detected = False
         self.prev_ball_detected = False
 
-        # 포스 데이터 변수
-        self.curr_f1_raw = 0.0; self.curr_f2_raw = 0.0; self.curr_f3_raw = 0.0
-        self.curr_f1_res = 0.0; self.curr_f2_res = 0.0; self.curr_f3_res = 0.0
+        # 포스 데이터 변수 (numpy vectorized)
+        self.sensor_force_raw = np.zeros(3, dtype=np.float64)
+        self.sensor_force_res = np.zeros(3, dtype=np.float64)
+        self.expected_force = np.zeros(3, dtype=np.float64)
 
         # 판 무게 하중 보정 2차 함수 계수 (force_coeffs.json 우선, 없으면 기본값)
         self.force_coeffs = self.load_force_coeffs()
@@ -77,7 +81,7 @@ class BallBalancingNode(Node):
         self.z_vel_filt = 0.0
 
         # Slow force bias tracking (dead band reference)
-        self.force_bias1 = 0.0; self.force_bias2 = 0.0; self.force_bias3 = 0.0
+        self.force_bias = np.zeros(3, dtype=np.float64)
 
         # 기본 게인 초기화
         self.Kp_ball = 5.0
@@ -90,28 +94,15 @@ class BallBalancingNode(Node):
         self.detq_attack = 0.3       # fast drop rate (ball loss)
         self.detq_recovery = 0.08    # slow recovery rate (ball back)
 
-        self.csv_data = [] 
-        self.target_data = np.zeros(12)
+        self.csv_data = []
+        self.target_data = np.zeros(15)
         self.f_xyz_manual = np.zeros(3, np.float64)
 
         self.config_file = 'balance_config.json'
         self.load_config()
 
         # --- Kalman Filter 초기화 ---
-        self.kf_dt = self.dt
-        self.kf_g = 9.81
-        self.kf_x = np.zeros(4)       # [x, y, vx, vy]
-        self.kf_P = np.diag([0.01, 0.01, 0.1, 0.1])
-        # State transition matrix
-        dt = self.kf_dt
-        self.kf_F = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]])
-        # Control matrix: [θ_pitch, -θ_roll] → ball accel
-        self.kf_B = np.array([[9.81*dt**2/2, 0],[0, -9.81*dt**2/2],[9.81*dt,0],[0,-9.81*dt]])
-        # Measurement matrix
-        self.kf_H = np.array([[1,0,0,0],[0,1,0,0]])
-        # Process noise (small: ~2% of tilt accel, rolling resistance etc.)
-        q = 0.02 * 9.81 * 0.17
-        self.kf_Q = np.diag([q**2*dt**4/4, q**2*dt**4/4, q**2*dt**2, q**2*dt**2])
+        self.kf = BallKalmanFilter(self.dt)
 
         self.get_logger().info("Ball Balancing Node Starting...")
 
@@ -181,7 +172,7 @@ class BallBalancingNode(Node):
         self.roll_offset_rad = 0.0
         self.pitch_offset_rad = 0.0
         
-        target_defaults = [0.0, 0.0, 0.0, 0.0, 0.0, 200.0, 10.0, 1.0, 0.2, 0.2, 50.0, 5.0]
+        target_defaults = [0.0, 0.0, 0.0, 0.0, 0.0, 200.0, 10.0, 1.0, 0.2, 0.2, 50.0, 5.0, 0.0, 0.0, 0.0]
         self.target_data[:] = target_defaults
 
         try:
@@ -201,7 +192,7 @@ class BallBalancingNode(Node):
                     self.detq_attack = cfg.get('detq_attack', self.detq_attack)
                     self.detq_recovery = cfg.get('detq_recovery', self.detq_recovery)
 
-                    for i in range(5, 12):
+                    for i in range(5, 15):
                         idx_str = str(i)
                         if idx_str in cfg.get('target_data', {}):
                             self.target_data[i] = cfg['target_data'][idx_str]
@@ -224,7 +215,7 @@ class BallBalancingNode(Node):
             'force_c0_s1': self.force_coeffs[0][0],
             'force_c0_s2': self.force_coeffs[1][0],
             'force_c0_s3': self.force_coeffs[2][0],
-            'target_data': {str(i): self.target_data[i] for i in range(5, 12)}
+            'target_data': {str(i): self.target_data[i] for i in range(5, 15)}
         }
         try:
             with open(self.config_file, 'w') as f:
@@ -258,30 +249,34 @@ class BallBalancingNode(Node):
                 pass
 
         if not self.shm_connected_pose:
-            if os.path.exists('/dev/shm/target_pose_shm') and os.path.exists('/dev/shm/eef_pos_shm') and os.path.exists('/dev/shm/eef_force_shm') and os.path.exists('/dev/shm/eef_vel_shm'):
+            if os.path.exists('/dev/shm/target_pose_shm') and os.path.exists('/dev/shm/eef_pos_shm') and os.path.exists('/dev/shm/eef_force_shm') and os.path.exists('/dev/shm/eef_vel_shm') and os.path.exists('/dev/shm/spring_error_shm'):
                 self.shm_pose = shared_memory.SharedMemory(name='target_pose_shm', create=False)
-                self.pose_array = np.ndarray((12,), dtype=np.float64, buffer=self.shm_pose.buf)
-                
+                self.pose_array = np.ndarray((15,), dtype=np.float64, buffer=self.shm_pose.buf)
+
                 self.shm_eef = shared_memory.SharedMemory(name='eef_pos_shm', create=False)
                 self.eef_array = np.ndarray((9,), dtype=np.float64, buffer=self.shm_eef.buf)
-                
+
                 self.shm_eef_force = shared_memory.SharedMemory(name='eef_force_shm', create=False)
                 self.eef_force_array = np.ndarray((3,), dtype=np.float64, buffer=self.shm_eef_force.buf)
 
                 self.shm_eef_vel = shared_memory.SharedMemory(name='eef_vel_shm', create=False)
                 self.eef_vel_array = np.ndarray((9,), dtype=np.float64, buffer=self.shm_eef_vel.buf)
 
+                self.shm_spring_err = shared_memory.SharedMemory(name='spring_error_shm', create=False)
+                self.spring_err_array = np.ndarray((3,), dtype=np.float64, buffer=self.shm_spring_err.buf)
+
                 from multiprocessing.resource_tracker import unregister
                 unregister(self.shm_pose._name, 'shared_memory')
                 unregister(self.shm_eef._name, 'shared_memory')
                 unregister(self.shm_eef_force._name, 'shared_memory')
                 unregister(self.shm_eef_vel._name, 'shared_memory')
-                
+                unregister(self.shm_spring_err._name, 'shared_memory')
+
                 self.pose_array[:] = self.target_data[:]
                 self.shm_connected_pose = True
 
     def control_loop(self):
-        if self.shm_connected_pose and (not os.path.exists('/dev/shm/target_pose_shm') or not os.path.exists('/dev/shm/eef_pos_shm') or not os.path.exists('/dev/shm/eef_force_shm') or not os.path.exists('/dev/shm/eef_vel_shm')):
+        if self.shm_connected_pose and (not os.path.exists('/dev/shm/target_pose_shm') or not os.path.exists('/dev/shm/eef_pos_shm') or not os.path.exists('/dev/shm/eef_force_shm') or not os.path.exists('/dev/shm/eef_vel_shm') or not os.path.exists('/dev/shm/spring_error_shm')):
             os._exit(0)
 
         self.loop_count += 1
@@ -299,15 +294,12 @@ class BallBalancingNode(Node):
         try:
             # --- 1. 원시 힘 + 미분 데이터 읽기 (SHM: f1,f2,f3,df1,df2,df3,timestamp) ---
             curr_raw = np.array(self.ball_state_array)
-            self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw = curr_raw[0:3]
+            self.sensor_force_raw = curr_raw[0:3].copy()
             df_raw = curr_raw[3:6]  # df from tracker (raw force derivative)
 
             # --- 2. 손가락 Z속도(global frame) 평균 → 게인 스케줄링용 ---
             if self.eef_vel_array is not None:
-                f1_vz = self.eef_vel_array[2]
-                f2_vz = self.eef_vel_array[5]
-                f3_vz = self.eef_vel_array[8]
-                z_vel_raw = (f1_vz + f2_vz + f3_vz) / 3.0
+                z_vel_raw = (self.eef_vel_array[2] + self.eef_vel_array[5] + self.eef_vel_array[8]) / 3.0
                 self.z_vel_filt = 0.85 * self.z_vel_filt + 0.15 * z_vel_raw
             else:
                 self.z_vel_filt = 0.0
@@ -315,43 +307,32 @@ class BallBalancingNode(Node):
             # --- 3. 판 무게 보정 (2차 모델) ---
             roll_deg = np.degrees(self.target_data[3])
             pitch_deg = np.degrees(self.target_data[4])
-
-            f1_exp = self.get_expected_force(roll_deg, pitch_deg, 0)
-            f2_exp = self.get_expected_force(roll_deg, pitch_deg, 1)
-            f3_exp = self.get_expected_force(roll_deg, pitch_deg, 2)
+            self.expected_force = np.array([
+                self.get_expected_force(roll_deg, pitch_deg, i) for i in range(3)
+            ])
 
             # --- 4. 정적 보정만 적용한 잔차 (eef_force, 관성 보상 제거) ---
-            self.curr_f1_res = self.curr_f1_raw - f1_exp
-            self.curr_f2_res = self.curr_f2_raw - f2_exp
-            self.curr_f3_res = self.curr_f3_raw - f3_exp
+            self.sensor_force_res = self.sensor_force_raw - self.expected_force
 
             # --- 5. CoP 계산 (raw measurement) ---
             cos_product = np.cos(self.target_data[3]) * np.cos(self.target_data[4])
-            f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res - PLATE_MASS * cos_product
+            f_total = np.sum(self.sensor_force_res) - PLATE_MASS * cos_product
 
-            avg_eef_x = (self.eef_array[0] + self.eef_array[3] + self.eef_array[6]) / 3.0
-            avg_eef_y = (self.eef_array[1] + self.eef_array[4] + self.eef_array[7]) / 3.0
+            eef_x = self.eef_array[0::3]  # [eef[0], eef[3], eef[6]]
+            eef_y = self.eef_array[1::3]  # [eef[1], eef[4], eef[7]]
+            eef_vx = self.eef_vel_array[0::3]
+            eef_vy = self.eef_vel_array[1::3]
 
-            avg_eef_vx = (self.eef_vel_array[0] + self.eef_vel_array[3] + self.eef_vel_array[6]) / 3.0
-            avg_eef_vy = (self.eef_vel_array[1] + self.eef_vel_array[4] + self.eef_vel_array[7]) / 3.0
+            avg_eef_x = np.mean(eef_x)
+            avg_eef_y = np.mean(eef_y)
+            avg_eef_vx = np.mean(eef_vx)
+            avg_eef_vy = np.mean(eef_vy)
 
             if f_total > 0.0:
-                bx = (self.eef_array[0] * self.curr_f1_res +
-                         self.eef_array[3] * self.curr_f2_res +
-                         self.eef_array[6] * self.curr_f3_res -
-                         avg_eef_x * PLATE_MASS * cos_product) / f_total
-                by = (self.eef_array[1] * self.curr_f1_res +
-                         self.eef_array[4] * self.curr_f2_res +
-                         self.eef_array[7] * self.curr_f3_res -
-                         avg_eef_y * PLATE_MASS * cos_product) / f_total
-                bvx = (self.eef_array[0] * df_raw[0] +
-                         self.eef_array[3] * df_raw[1] +
-                         self.eef_array[6] * df_raw[2] -
-                         avg_eef_x * PLATE_MASS * cos_product) / f_total
-                bvy = (self.eef_array[1] * df_raw[0] +
-                         self.eef_array[4] * df_raw[1] +
-                         self.eef_array[7] * df_raw[2] -
-                         avg_eef_y * PLATE_MASS * cos_product) / f_total
+                bx = (np.dot(eef_x, self.sensor_force_res) - avg_eef_x * PLATE_MASS * cos_product) / f_total
+                by = (np.dot(eef_y, self.sensor_force_res) - avg_eef_y * PLATE_MASS * cos_product) / f_total
+                bvx = (np.dot(eef_x, df_raw) - avg_eef_x * PLATE_MASS * cos_product) / f_total
+                bvy = (np.dot(eef_y, df_raw) - avg_eef_y * PLATE_MASS * cos_product) / f_total
             else:
                 bx = avg_eef_x
                 by = avg_eef_y
@@ -359,20 +340,15 @@ class BallBalancingNode(Node):
                 bvy = avg_eef_vy
 
             # --- 6. Kalman Filter: 공 상태 추정 ---
-            # Predict: tilt command → expected ball dynamics
             pitch_cmd = self.target_data[4] - self.pitch_offset_rad
             roll_cmd = -(self.target_data[3] - self.roll_offset_rad)
-            self.kf_predict(pitch_cmd, roll_cmd)
+            self.kf.predict(pitch_cmd, roll_cmd)
 
-            # Update: CoP measurement (adaptive R based on f_total)
             if f_total > 0:
-                self.kf_update(bx, by, f_total)
+                self.kf.update(bx, by, f_total)
 
-            # Use Kalman state for ball position/velocity
-            self.curr_ball_x = self.kf_x[0]
-            self.curr_ball_y = self.kf_x[1]
-            self.curr_ball_vx = self.kf_x[2]
-            self.curr_ball_vy = self.kf_x[3]
+            self.curr_ball_x, self.curr_ball_y = self.kf.position
+            self.curr_ball_vx, self.curr_ball_vy = self.kf.velocity
 
             self.ball_detected = (f_total >= F_TOTAL_MIN)
             self.prev_ball_detected = self.ball_detected or self.prev_ball_detected
@@ -389,9 +365,9 @@ class BallBalancingNode(Node):
             DEAD_BAND = 0.01  # temporarily disabled for data collection
 
             
-            f_err = np.array([self.curr_f1_res - np.degrees(cmd_tilt[1]) + 3.21,
-                              self.curr_f2_res - np.degrees(cmd_tilt[1]) + 2.76,
-                              self.curr_f3_res - np.degrees(cmd_tilt[0]) * 3.2163 + np.degrees(cmd_tilt[1]) * 0.57]) - FORCE_BIAS
+            f_err = np.array([self.sensor_force_res[0] - np.degrees(cmd_tilt[1]) + 3.21,
+                              self.sensor_force_res[1] - np.degrees(cmd_tilt[1]) + 2.76,
+                              self.sensor_force_res[2] - np.degrees(cmd_tilt[0]) * 3.2163 + np.degrees(cmd_tilt[1]) * 0.57]) - FORCE_BIAS
 
             mask = np.abs(df_raw) > DEAD_BAND
             df_deadband = np.where(mask, df_raw - np.sign(df_raw) * DEAD_BAND, 0.0) 
@@ -436,25 +412,50 @@ class BallBalancingNode(Node):
             # --- 8. CSV 로깅 ---
             eef_vel = list(self.eef_vel_array) if self.eef_vel_array is not None else [0.0]*9
             eef_cur = list(self.eef_force_array) if (self.shm_connected_pose and self.eef_force_array is not None) else [0.0]*3
-            f_total = self.curr_f1_res + self.curr_f2_res + self.curr_f3_res
-            cop_x_raw = (self.eef_array[0]*self.curr_f1_res + self.eef_array[3]*self.curr_f2_res + self.eef_array[6]*self.curr_f3_res) if f_total > 0 else 0.0
-            cop_y_raw = (self.eef_array[1]*self.curr_f1_res + self.eef_array[4]*self.curr_f2_res + self.eef_array[7]*self.curr_f3_res) if f_total > 0 else 0.0
+            spring_err = list(self.spring_err_array) if (self.shm_connected_pose and self.spring_err_array is not None) else [0.0]*3
+            f_total = np.sum(self.sensor_force_res)
+            cop_x_raw = np.dot(eef_x, self.sensor_force_res) if f_total > 0 else 0.0
+            cop_y_raw = np.dot(eef_y, self.sensor_force_res) if f_total > 0 else 0.0
             self.csv_data.append([
-                now, self.target_data[3], self.target_data[4],
-                self.curr_f1_raw, self.curr_f2_raw, self.curr_f3_raw,
-                self.curr_f1_res, self.curr_f2_res, self.curr_f3_res,
-                f1_exp, f2_exp, f3_exp,
-                self.curr_ball_x, self.curr_ball_y, self.curr_ball_vx, self.curr_ball_vy,
-                self.z_vel_filt, avg_eef_x, avg_eef_y,
-                f_err[0], f_err[1], f_err[2],
-                self.f_integral[0], self.f_integral[1], self.f_integral[2],
-                df_raw[0], df_raw[1], df_raw[2],
-                self.target_data[2], self.target_data[5], self.target_data[6],
-                cop_x_raw, cop_y_raw, f_total,
-                bx, by,  # raw CoP before Kalman
-                self.detection_quality,
-                self.kf_P.trace()
-            ] + eef_vel + eef_cur)
+                now,                               # 1. timestamp (s)
+                self.target_data[3],               # 2. roll_des (rad)
+                self.target_data[4],               # 3. pitch_des (rad)
+                self.sensor_force_raw[0],          # 4. sensor 1 raw force (gf)
+                self.sensor_force_raw[1],          # 5. sensor 2 raw force (gf)
+                self.sensor_force_raw[2],          # 6. sensor 3 raw force (gf)
+                self.sensor_force_res[0],          # 7. sensor 1 residue force = raw - expected (gf)
+                self.sensor_force_res[1],          # 8. sensor 2 residue force (gf)
+                self.sensor_force_res[2],          # 9. sensor 3 residue force (gf)
+                self.expected_force[0],            # 10. sensor 1 expected force from tilt model (gf)
+                self.expected_force[1],            # 11. sensor 2 expected force from tilt model (gf)
+                self.expected_force[2],            # 12. sensor 3 expected force from tilt model (gf)
+                self.curr_ball_x,                  # 13. Kalman ball X position (m)
+                self.curr_ball_y,                  # 14. Kalman ball Y position (m)
+                self.curr_ball_vx,                 # 15. Kalman ball X velocity (m/s)
+                self.curr_ball_vy,                 # 16. Kalman ball Y velocity (m/s)
+                self.z_vel_filt,                   # 17. filtered avg finger Z velocity (m/s)
+                avg_eef_x,                         # 18. EEF centroid X (m)
+                avg_eef_y,                         # 19. EEF centroid Y (m)
+                f_err[0],                          # 20. force error sensor 1 (gf)
+                f_err[1],                          # 21. force error sensor 2 (gf)
+                f_err[2],                          # 22. force error sensor 3 (gf)
+                self.f_integral[0],                # 23. ball PID I-term x (gf*s) [reserved]
+                self.f_integral[1],                # 24. ball PID I-term y (gf*s) [reserved]
+                self.f_integral[2],                # 25. ball PID I-term z (gf*s) [reserved]
+                df_raw[0],                         # 26. raw force derivative sensor 1 (gf/s)
+                df_raw[1],                         # 27. raw force derivative sensor 2 (gf/s)
+                df_raw[2],                         # 28. raw force derivative sensor 3 (gf/s)
+                self.target_data[2],               # 29. xyz_des_z - Z position target (m)
+                self.target_data[5],               # 30. K_task - position stiffness (N/m)
+                self.target_data[6],               # 31. D_task - velocity damping (N/(m/s))
+                cop_x_raw,                         # 32. raw CoP X before centroid sub (m)
+                cop_y_raw,                         # 33. raw CoP Y before centroid sub (m)
+                f_total,                           # 34. total normal force at contact (gf)
+                bx,                                # 35. CoP X relative to centroid (m) = cop_x_meas
+                by,                                # 36. CoP Y relative to centroid (m) = cop_y_meas
+                self.detection_quality,            # 37. detection quality EMA (0..1)
+                self.kf.P_trace                    # 38. Kalman covariance trace
+            ] + eef_vel + eef_cur + spring_err)    # 39-47: eef vel (9), 48-50: eef force (3), 51-53: spring_err (z, roll, pitch)
 
         except Exception as e:
             self.get_logger().error(f"Error in control loop: {e}")
@@ -465,10 +466,34 @@ class BallBalancingNode(Node):
         if self.shm_eef: self.shm_eef.close()
         if self.shm_eef_force: self.shm_eef_force.close()
         if self.shm_eef_vel: self.shm_eef_vel.close()
+        if self.shm_spring_err: self.shm_spring_err.close()
         if self.show_gui: cv2.destroyAllWindows()
         super().destroy_node()
 
 class TuningUI:
+    # --- Slider range constants ---
+    SLIDER_KP_BALL_MAX = 20.0
+    SLIDER_KD_BALL_MAX = 1.0
+    SLIDER_KI_BALL_MAX = 0.01
+    SLIDER_DETQ_OFFSET_MAX = 20.0
+    SLIDER_DETQ_SCALE_MAX = 100.0
+    SLIDER_DETQ_ATTACK_MAX = 0.8
+    SLIDER_DETQ_RECOVERY_MAX = 0.4
+    SLIDER_MAX_TILT_MAX = 20.0
+    SLIDER_ROLL_OFFSET_MAX = 20.0
+    SLIDER_PITCH_OFFSET_MAX = 20.0
+    SLIDER_C0_MAX = 300.0
+    SLIDER_KI_Z_MAX = 5.0
+    SLIDER_KI_ROLL_MAX = 1.0
+    SLIDER_KI_PITCH_MAX = 1.0
+    SLIDER_K_TASK_MAX = 200.0
+    SLIDER_K_TASK2_MAX = 5.0
+    SLIDER_D_TASK_MAX = 10.0
+    SLIDER_K_ORI_MAX = 1.0
+    SLIDER_FRIC_STATIC_MAX = 0.2
+    SLIDER_FRIC_BIAS_MAX = 0.2
+    SLIDER_FRIC_VEL_COMP_MAX = 50.0
+
     def __init__(self, node):
         self.node = node
         self.root = tk.Tk()
@@ -533,19 +558,19 @@ class TuningUI:
 
         self.lbl_kp_ball = ttk.Label(pd_frame, text=f"Kp_ball: {self.node.Kp_ball:.3f}", width=20)
         self.lbl_kp_ball.pack(anchor='w')
-        self.sl_kp_ball = ttk.Scale(pd_frame, from_=0, to=20, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
+        self.sl_kp_ball = ttk.Scale(pd_frame, from_=0, to=self.SLIDER_KP_BALL_MAX, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
         self.sl_kp_ball.set(self.node.Kp_ball)
         self.sl_kp_ball.pack(fill='x', expand=True, pady=(0,5))
 
         self.lbl_kd_ball = ttk.Label(pd_frame, text=f"Kd_ball: {self.node.Kd_ball:.3f}", width=20)
         self.lbl_kd_ball.pack(anchor='w')
-        self.sl_kd_ball = ttk.Scale(pd_frame, from_=0, to=1.0, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
+        self.sl_kd_ball = ttk.Scale(pd_frame, from_=0, to=self.SLIDER_KD_BALL_MAX, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
         self.sl_kd_ball.set(self.node.Kd_ball)
         self.sl_kd_ball.pack(fill='x', expand=True, pady=(0,5))
 
         self.lbl_ki_ball = ttk.Label(pd_frame, text=f"Ki_ball: {self.node.Ki_ball:.5f}", width=20)
         self.lbl_ki_ball.pack(anchor='w')
-        self.sl_ki_ball = ttk.Scale(pd_frame, from_=0, to=0.01, orient='horizontal', command=lambda v: self.update_ball_gain("Ki", v))
+        self.sl_ki_ball = ttk.Scale(pd_frame, from_=0, to=self.SLIDER_KI_BALL_MAX, orient='horizontal', command=lambda v: self.update_ball_gain("Ki", v))
         self.sl_ki_ball.set(self.node.Ki_ball)
         self.sl_ki_ball.pack(fill='x', expand=True)
 
@@ -555,25 +580,25 @@ class TuningUI:
 
         self.lbl_detq_offset = ttk.Label(detq_frame, text=f"DetQ Offset: {self.node.detq_offset:.1f} gf", width=35)
         self.lbl_detq_offset.pack(anchor='w')
-        self.sl_detq_offset = ttk.Scale(detq_frame, from_=0.0, to=20.0, orient='horizontal', command=lambda v: self.update_detq("offset", v))
+        self.sl_detq_offset = ttk.Scale(detq_frame, from_=0.0, to=self.SLIDER_DETQ_OFFSET_MAX, orient='horizontal', command=lambda v: self.update_detq("offset", v))
         self.sl_detq_offset.set(self.node.detq_offset)
         self.sl_detq_offset.pack(fill='x', expand=True)
 
         self.lbl_detq_scale = ttk.Label(detq_frame, text=f"DetQ Scale: {self.node.detq_scale:.1f} gf", width=35)
         self.lbl_detq_scale.pack(anchor='w')
-        self.sl_detq_scale = ttk.Scale(detq_frame, from_=5.0, to=100.0, orient='horizontal', command=lambda v: self.update_detq("scale", v))
+        self.sl_detq_scale = ttk.Scale(detq_frame, from_=5.0, to=self.SLIDER_DETQ_SCALE_MAX, orient='horizontal', command=lambda v: self.update_detq("scale", v))
         self.sl_detq_scale.set(self.node.detq_scale)
         self.sl_detq_scale.pack(fill='x', expand=True)
 
         self.lbl_detq_attack = ttk.Label(detq_frame, text=f"DetQ Attack: {self.node.detq_attack:.2f}", width=35)
         self.lbl_detq_attack.pack(anchor='w')
-        self.sl_detq_attack = ttk.Scale(detq_frame, from_=0.05, to=0.8, orient='horizontal', command=lambda v: self.update_detq("attack", v))
+        self.sl_detq_attack = ttk.Scale(detq_frame, from_=0.05, to=self.SLIDER_DETQ_ATTACK_MAX, orient='horizontal', command=lambda v: self.update_detq("attack", v))
         self.sl_detq_attack.set(self.node.detq_attack)
         self.sl_detq_attack.pack(fill='x', expand=True)
 
         self.lbl_detq_recovery = ttk.Label(detq_frame, text=f"DetQ Recovery: {self.node.detq_recovery:.2f}", width=35)
         self.lbl_detq_recovery.pack(anchor='w')
-        self.sl_detq_recovery = ttk.Scale(detq_frame, from_=0.01, to=0.4, orient='horizontal', command=lambda v: self.update_detq("recovery", v))
+        self.sl_detq_recovery = ttk.Scale(detq_frame, from_=0.01, to=self.SLIDER_DETQ_RECOVERY_MAX, orient='horizontal', command=lambda v: self.update_detq("recovery", v))
         self.sl_detq_recovery.set(self.node.detq_recovery)
         self.sl_detq_recovery.pack(fill='x', expand=True)
 
@@ -583,7 +608,7 @@ class TuningUI:
 
         self.lbl_max_tilt = ttk.Label(limit_frame, text=f"Max Tilt Angle: {self.node.max_tilt_deg:.1f} deg", width=30)
         self.lbl_max_tilt.pack(anchor='w')
-        self.sl_max_tilt = ttk.Scale(limit_frame, from_=1.0, to=20.0, orient='horizontal', command=self.update_max_tilt)
+        self.sl_max_tilt = ttk.Scale(limit_frame, from_=1.0, to=self.SLIDER_MAX_TILT_MAX, orient='horizontal', command=self.update_max_tilt)
         self.sl_max_tilt.set(self.node.max_tilt_deg)
         self.sl_max_tilt.pack(fill='x', expand=True)
 
@@ -603,13 +628,16 @@ class TuningUI:
         self.gain_labels = {}
         self.hw_sliders = {}
         self.gains_def_list = [
-            ("Kp (K_task - Position)", 5, 200.0), 
-            ("Kp (K_task - Force)", 11, 5.0), 
-            ("Kd (D_task - Velocity)", 6, 10.0), 
-            ("Kp_rot (K_ori - Orientation)", 7, 1.0),
-            ("Friction Static", 8, 0.2),         
-            ("Friction Bias", 9, 0.2),           
-            ("Friction Vel Compensate", 10, 50.0) 
+            ("Kp (K_task - Position)", 5, self.SLIDER_K_TASK_MAX),
+            ("Kp (K_task - Force)", 11, self.SLIDER_K_TASK2_MAX),
+            ("Kd (D_task - Velocity)", 6, self.SLIDER_D_TASK_MAX),
+            ("Kp_rot (K_ori - Orientation)", 7, self.SLIDER_K_ORI_MAX),
+            ("Friction Static", 8, self.SLIDER_FRIC_STATIC_MAX),
+            ("Friction Bias", 9, self.SLIDER_FRIC_BIAS_MAX),
+            ("Friction Vel Compensate", 10, self.SLIDER_FRIC_VEL_COMP_MAX),
+            ("Ki_z (Z Integral)", 12, self.SLIDER_KI_Z_MAX),
+            ("Ki_roll (Roll Integral)", 13, self.SLIDER_KI_ROLL_MAX),
+            ("Ki_pitch (Pitch Integral)", 14, self.SLIDER_KI_PITCH_MAX),
         ]
         for name, idx, max_val in self.gains_def_list:
             frame = ttk.Frame(gain_frame)
@@ -628,13 +656,13 @@ class TuningUI:
 
         self.lbl_roll_offset = ttk.Label(offset_frame, text=f"Roll Offset: {np.degrees(self.node.roll_offset_rad):>7.3f}", style="Data.TLabel", width=25)
         self.lbl_roll_offset.pack(anchor='w')
-        self.slider_roll_offset = ttk.Scale(offset_frame, from_=-20.0, to=20.0, orient='horizontal', command=lambda val: self.update_offset_value("roll", val))
+        self.slider_roll_offset = ttk.Scale(offset_frame, from_=-self.SLIDER_ROLL_OFFSET_MAX, to=self.SLIDER_ROLL_OFFSET_MAX, orient='horizontal', command=lambda val: self.update_offset_value("roll", val))
         self.slider_roll_offset.set(np.degrees(self.node.roll_offset_rad))
         self.slider_roll_offset.pack(fill='x')
 
         self.lbl_pitch_offset = ttk.Label(offset_frame, text=f"Pitch Offset: {np.degrees(self.node.pitch_offset_rad):>7.3f}", style="Data.TLabel", width=25)
         self.lbl_pitch_offset.pack(anchor='w')
-        self.slider_pitch_offset = ttk.Scale(offset_frame, from_=-20.0, to=20.0, orient='horizontal', command=lambda val: self.update_offset_value("pitch", val))
+        self.slider_pitch_offset = ttk.Scale(offset_frame, from_=-self.SLIDER_PITCH_OFFSET_MAX, to=self.SLIDER_PITCH_OFFSET_MAX, orient='horizontal', command=lambda val: self.update_offset_value("pitch", val))
         self.slider_pitch_offset.set(np.degrees(self.node.pitch_offset_rad))
         self.slider_pitch_offset.pack(fill='x')
 
@@ -644,19 +672,19 @@ class TuningUI:
 
         self.lbl_c0_s1 = ttk.Label(bias_const_frame, text=f"Sensor 1 c0: {self.node.force_coeffs[0][0]:>7.3f}", style="Data.TLabel", width=25)
         self.lbl_c0_s1.pack(anchor='w')
-        self.slider_c0_s1 = ttk.Scale(bias_const_frame, from_=0.0, to=300.0, orient='horizontal', command=lambda val: self.update_c0_value(0, val))
+        self.slider_c0_s1 = ttk.Scale(bias_const_frame, from_=0.0, to=self.SLIDER_C0_MAX, orient='horizontal', command=lambda val: self.update_c0_value(0, val))
         self.slider_c0_s1.set(self.node.force_coeffs[0][0])
         self.slider_c0_s1.pack(fill='x', pady=(0, 5))
 
         self.lbl_c0_s2 = ttk.Label(bias_const_frame, text=f"Sensor 2 c0: {self.node.force_coeffs[1][0]:>7.3f}", style="Data.TLabel", width=25)
         self.lbl_c0_s2.pack(anchor='w')
-        self.slider_c0_s2 = ttk.Scale(bias_const_frame, from_=0.0, to=300.0, orient='horizontal', command=lambda val: self.update_c0_value(1, val))
+        self.slider_c0_s2 = ttk.Scale(bias_const_frame, from_=0.0, to=self.SLIDER_C0_MAX, orient='horizontal', command=lambda val: self.update_c0_value(1, val))
         self.slider_c0_s2.set(self.node.force_coeffs[1][0])
         self.slider_c0_s2.pack(fill='x', pady=(0, 5))
 
         self.lbl_c0_s3 = ttk.Label(bias_const_frame, text=f"Sensor 3 c0: {self.node.force_coeffs[2][0]:>7.3f}", style="Data.TLabel", width=25)
         self.lbl_c0_s3.pack(anchor='w')
-        self.slider_c0_s3 = ttk.Scale(bias_const_frame, from_=0.0, to=300.0, orient='horizontal', command=lambda val: self.update_c0_value(2, val))
+        self.slider_c0_s3 = ttk.Scale(bias_const_frame, from_=0.0, to=self.SLIDER_C0_MAX, orient='horizontal', command=lambda val: self.update_c0_value(2, val))
         self.slider_c0_s3.set(self.node.force_coeffs[2][0])
         self.slider_c0_s3.pack(fill='x')
 
@@ -773,8 +801,8 @@ class TuningUI:
 
         # 1. 기존 Tkinter 텍스트 필드 실시간 업데이트 로직
         if self.node.shm_connected_ball:
-            self.lbl_curr_raw.config(text=f"Raw 1: {self.node.curr_f1_raw:>6.1f} | Raw 2: {self.node.curr_f2_raw:>6.1f} | Raw 3: {self.node.curr_f3_raw:>6.1f}")
-            self.lbl_curr_res.config(text=f"Res 1: {self.node.curr_f1_res:>6.1f} | Res 2: {self.node.curr_f2_res:>6.1f} | Res 3: {self.node.curr_f3_res:>6.1f}")
+            self.lbl_curr_raw.config(text=f"Raw 1: {self.node.sensor_force_raw[0]:>6.1f} | Raw 2: {self.node.sensor_force_raw[1]:>6.1f} | Raw 3: {self.node.sensor_force_raw[2]:>6.1f}")
+            self.lbl_curr_res.config(text=f"Res 1: {self.node.sensor_force_res[0]:>6.1f} | Res 2: {self.node.sensor_force_res[1]:>6.1f} | Res 3: {self.node.sensor_force_res[2]:>6.1f}")
             
             if self.node.ball_detected:
                 self.lbl_ball_status.config(text="Ball: DETECTED", foreground="blue")
@@ -878,7 +906,8 @@ def main(args=None):
                         'eef_v1_x', 'eef_v1_y', 'eef_v1_z',
                         'eef_v2_x', 'eef_v2_y', 'eef_v2_z',
                         'eef_v3_x', 'eef_v3_y', 'eef_v3_z',
-                        'eef_cur_1', 'eef_cur_2', 'eef_cur_3'
+                        'eef_cur_1', 'eef_cur_2', 'eef_cur_3',
+                        'spring_z_err', 'spring_roll_err', 'spring_pitch_err'
                     ])
                     writer.writerows(node.csv_data)
                 print(f"\n[CSV 저장] '{filename}'에 데이터를 성공적으로 저장했습니다.")

@@ -65,8 +65,8 @@ public:
     BallCalibrationNode() : Node("ball_calibration_node"), running_(true), is_paused_(true), shm_connected_(false) {
         
         // 1. target_data 초기화
-        double defaults[12] = {0.0, 0.0, 0.0, 0.0, 0.0, 200.0, 10.0, 1.0, 0.2, 0.2, 50.0, 5.0};
-        for(int i=0; i<12; ++i) target_data_[i] = defaults[i];
+        double defaults[15] = {0.0, 0.0, 0.0, 0.0, 0.0, 200.0, 10.0, 1.0, 0.2, 0.2, 50.0, 5.0, 0.0, 0.0, 0.0};
+        for(int i=0; i<15; ++i) target_data_[i] = defaults[i];
 
         // 2. Config 자동 로드
         load_tactile_config("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
@@ -85,7 +85,7 @@ public:
         for (auto& th : capture_threads_) {
             if (th.joinable()) th.join();
         }
-        if (pose_ptr_ && pose_ptr_ != MAP_FAILED) munmap(pose_ptr_, 12 * sizeof(double));
+        if (pose_ptr_ && pose_ptr_ != MAP_FAILED) munmap(pose_ptr_, 15 * sizeof(double));
         if (eef_ptr_ && eef_ptr_ != MAP_FAILED) munmap(eef_ptr_, 9 * sizeof(double));
         if (fd_pose_ != -1) close(fd_pose_);
         if (fd_eef_ != -1) close(fd_eef_);
@@ -144,7 +144,7 @@ public:
         std::ifstream file(filename);
         if (file.is_open()) {
             file >> balance_json_;
-            for (int i = 5; i < 12; ++i) {
+            for (int i = 5; i < 15; ++i) {
                 std::string idx_str = std::to_string(i);
                 if (balance_json_.contains("target_data") && balance_json_["target_data"].contains(idx_str)) {
                     target_data_[i] = balance_json_["target_data"][idx_str].get<double>();
@@ -154,7 +154,7 @@ public:
         }
         
         if (shm_connected_ && pose_ptr_) {
-            for (int i = 0; i < 12; ++i) pose_ptr_[i] = target_data_[i];
+            for (int i = 0; i < 15; ++i) pose_ptr_[i] = target_data_[i];
         }
     }
 
@@ -170,13 +170,13 @@ public:
             if (!shm_connected_) {
                 if (access("/dev/shm/target_pose_shm", F_OK) != -1 && access("/dev/shm/eef_pos_shm", F_OK) != -1) {
                     fd_pose_ = shm_open("target_pose_shm", O_RDWR, 0666);
-                    pose_ptr_ = (double*)mmap(0, 12 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_pose_, 0);
+                    pose_ptr_ = (double*)mmap(0, 15 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_pose_, 0);
                     
                     fd_eef_ = shm_open("eef_pos_shm", O_RDONLY, 0666);
                     eef_ptr_ = (double*)mmap(0, 9 * sizeof(double), PROT_READ, MAP_SHARED, fd_eef_, 0);
 
                     if (pose_ptr_ != MAP_FAILED && eef_ptr_ != MAP_FAILED) {
-                        for (int i = 0; i < 12; ++i) pose_ptr_[i] = target_data_[i]; 
+                        for (int i = 0; i < 15; ++i) pose_ptr_[i] = target_data_[i]; 
                         shm_connected_ = true;
                         RCLCPP_INFO(this->get_logger(), "SHM Connected & Initial target_pose injected.");
                     }
@@ -391,7 +391,7 @@ public:
         if (shm_connected_ && pose_ptr_) {
             target_data_[3] = 0.0; // roll = 0
             target_data_[4] = 0.0; // pitch = 0
-            for (int i = 0; i < 12; ++i) pose_ptr_[i] = target_data_[i];
+            for (int i = 0; i < 15; ++i) pose_ptr_[i] = target_data_[i];
         }
 
         // 2. Wait for stabilization
@@ -543,7 +543,7 @@ private:
     
     std::string tactile_config_file_;
     std::string balance_config_file_;
-    double target_data_[12];
+    double target_data_[15];
     
     int fd_pose_ = -1, fd_eef_ = -1;
     double* pose_ptr_ = nullptr;

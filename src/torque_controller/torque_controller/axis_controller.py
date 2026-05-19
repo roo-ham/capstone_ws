@@ -29,8 +29,8 @@ class BallBalancingNode(Node):
         # [z_des0, z_des1, z_des2, roll_des, pitch_des, K_task, D_task, K_ori]
         self.curr_pos = np.zeros(2)
         self.curr_vel = np.zeros(2)
-        self.target_data = np.zeros(8)
-        self.target_data[:] = [0, 0, 0, 0, 0, 500.0, 5.0, 1.0]
+        self.target_data = np.zeros(15)
+        self.target_data[:] = [0, 0, 0, 0, 0, 500.0, 5.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         # 안전 제한 설정 (하드웨어 보호용 상한선)
         self.MAX_FINGER_Z = 0.50          # Z축 이동 제한 (0 ~ 0.5m)
@@ -58,7 +58,7 @@ class BallBalancingNode(Node):
             
             if self.shm_pose is None:
                 self.shm_pose = shared_memory.SharedMemory(name='target_pose_shm', create=False)
-                self.pose_array = np.ndarray((8,), dtype=np.float64, buffer=self.shm_pose.buf)
+                self.pose_array = np.ndarray((15,), dtype=np.float64, buffer=self.shm_pose.buf)
 
                 from multiprocessing.resource_tracker import unregister
                 unregister(self.shm_pose._name, 'shared_memory')

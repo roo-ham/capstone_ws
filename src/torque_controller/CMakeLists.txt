@@ -101,7 +101,9 @@ install(PROGRAMS
   torque_controller/position_controller.py
   torque_controller/visual_ball_tracker_node.py
   torque_controller/balance_controller.py
+  torque_controller/balance_controller_ball_est.py
   torque_controller/axis_controller.py
+  torque_controller/kalman_filter.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

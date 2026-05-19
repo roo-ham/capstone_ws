@@ -17,6 +17,7 @@
 #include <thread>
 #include <mutex>
 #include <cmath>
+#include <algorithm>
 #include <vector>
 
 class SynchronizedSpringDamperNode : public rclcpp::Node {
@@ -44,15 +45,17 @@ public:
         // 메모리 해제 및 SHM 파일 완벽 삭제
         munmap(state_ptr_, 2 * 12 * sizeof(double));
         munmap(cmd_ptr_, 12 * sizeof(double));
-        if (pose_ptr_) munmap(pose_ptr_, 12 * sizeof(double));
+        if (pose_ptr_) munmap(pose_ptr_, 15 * sizeof(double));
         if (eef_ptr_) munmap(eef_ptr_, 9 * sizeof(double));
         if (eef_vel_ptr_) munmap(eef_vel_ptr_, 9 * sizeof(double));
-        if (eef_force_ptr_) munmap(eef_force_ptr_, 3 * sizeof(double)); // [신설] 메모리 해제
-        
+        if (eef_force_ptr_) munmap(eef_force_ptr_, 3 * sizeof(double));
+        if (spring_err_ptr_) munmap(spring_err_ptr_, 3 * sizeof(double));
+
         shm_unlink("target_pose_shm");
         shm_unlink("eef_pos_shm");
         shm_unlink("eef_vel_shm");
-        shm_unlink("eef_force_shm"); // [신설] 언링크
+        shm_unlink("eef_force_shm");
+        shm_unlink("spring_error_shm");
     }
 
 private:
@@ -86,7 +89,24 @@ private:
 
     double gravity_comp_gain_ = 2.0;
     double F_FRIC_STATIC_ = 0.045, F_FRIC_BIAS_ = 0.0, FRIC_V_COMPENSATE_ = 10.0;
-    
+
+    // Integral gains (received via target_pose_shm[12-14])
+    double Ki_z_ = 0.0;
+    double Ki_roll_ = 0.0;
+    double Ki_pitch_ = 0.0;
+
+    // Per-finger integral accumulators (anti-windup clamped)
+    double z_integral_[3] = {0.0, 0.0, 0.0};
+    double roll_integral_[3] = {0.0, 0.0, 0.0};
+    double pitch_integral_[3] = {0.0, 0.0, 0.0};
+
+    static constexpr double INTEGRAL_CLAMP_Z_ = 0.05;
+    static constexpr double INTEGRAL_CLAMP_RP_ = 0.05;
+    static constexpr double CONTROL_DT_ = 0.002;
+
+    // Spring error SHM pointer
+    double* spring_err_ptr_ = nullptr;
+
     Eigen::VectorXd D_joint_weight_;
     std::vector<Eigen::Vector3d> curr_pos_;
     std::vector<Eigen::Vector3d> curr_vel_;
@@ -145,16 +165,20 @@ private:
         state_ptr_ = (double*)mmap(0, 2 * 12 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_state, 0);
         cmd_ptr_ = (double*)mmap(0, 12 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_cmd, 0);
 
-        // --- 1. Target Pose SHM (B->S, 11차원 강제 생성) ---
-        shm_unlink("target_pose_shm"); 
+        // --- 1. Target Pose SHM (B->S, 15차원: pos/rot/gains/friction/integral) ---
+        shm_unlink("target_pose_shm");
         int fd_pose = shm_open("target_pose_shm", O_CREAT | O_RDWR, 0666);
-        ftruncate(fd_pose, 12 * sizeof(double));
-        pose_ptr_ = (double*)mmap(0, 12 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_pose, 0);
-        
+        ftruncate(fd_pose, 15 * sizeof(double));
+        pose_ptr_ = (double*)mmap(0, 15 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_pose, 0);
+
         for (int i = 0; i < 8; ++i) pose_ptr_[i] = 0.0;
         pose_ptr_[8] = F_FRIC_STATIC_;
         pose_ptr_[9] = F_FRIC_BIAS_;
         pose_ptr_[10] = FRIC_V_COMPENSATE_;
+        pose_ptr_[11] = 0.0;
+        pose_ptr_[12] = 0.0; // Ki_z_
+        pose_ptr_[13] = 0.0; // Ki_roll_
+        pose_ptr_[14] = 0.0; // Ki_pitch_
 
         // --- 2. EEF Position SHM (S->B, 9차원: 3 fingers × XYZ global frame) ---
         shm_unlink("eef_pos_shm");
@@ -176,7 +200,14 @@ private:
         eef_force_ptr_ = (double*)mmap(0, 3 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_eef_force, 0);
         for (int i = 0; i < 3; ++i) eef_force_ptr_[i] = 0.0;
 
-        RCLCPP_INFO(this->get_logger(), "S Node strictly created SHMs (target_pose_shm, eef_pos_shm, eef_vel_shm, eef_force_shm)");
+        // --- 5. Spring Error SHM (S->B, 3차원: z_err, roll_err, pitch_err) ---
+        shm_unlink("spring_error_shm");
+        int fd_spring_err = shm_open("spring_error_shm", O_CREAT | O_RDWR, 0666);
+        ftruncate(fd_spring_err, 3 * sizeof(double));
+        spring_err_ptr_ = (double*)mmap(0, 3 * sizeof(double), PROT_READ | PROT_WRITE, MAP_SHARED, fd_spring_err, 0);
+        for (int i = 0; i < 3; ++i) spring_err_ptr_[i] = 0.0;
+
+        RCLCPP_INFO(this->get_logger(), "S Node strictly created SHMs (target_pose_shm, eef_pos_shm, eef_vel_shm, eef_force_shm, spring_error_shm)");
     }
 
     void init_pinocchio() {
@@ -235,6 +266,9 @@ private:
                 F_FRIC_BIAS_       = pose_ptr_[9];
                 FRIC_V_COMPENSATE_ = pose_ptr_[10];
                 K_task_2_          = pose_ptr_[11];
+                Ki_z_              = pose_ptr_[12];
+                Ki_roll_           = pose_ptr_[13];
+                Ki_pitch_          = pose_ptr_[14];
             }
 
             pinocchio::framesForwardKinematics(model_, data_, q);
@@ -295,13 +329,49 @@ private:
                 Eigen::Vector3d evy = j_roll.dot(curr_vel_[i]) * j_roll;
                 Eigen::Vector3d ez = k_rp.dot(pos_center - curr_pos_[i]) * k_rp;
 
-                Eigen::Vector3d force_p = (K_task_ * ez) + (K_task_2_ * Eigen::Map<Eigen::Vector3d>(xyz_des_));
-                Eigen::Vector3d force_pd = D_task_ * (evx + evy);           
-                Eigen::Vector3d torque_R(K_ori_ * e_rp.x(), K_ori_ * e_rp.y(), 0.0); 
+                // Integral accumulation (per-finger, joint-space level)
+                double z_err_scalar = k_rp.dot(pos_center - curr_pos_[i]);
+                z_integral_[i] += z_err_scalar * CONTROL_DT_;
+                roll_integral_[i] += e_rp.x() * CONTROL_DT_;
+                pitch_integral_[i] += e_rp.y() * CONTROL_DT_;
+
+                // Anti-windup clamping
+                z_integral_[i] = std::clamp(z_integral_[i], -INTEGRAL_CLAMP_Z_, INTEGRAL_CLAMP_Z_);
+                roll_integral_[i] = std::clamp(roll_integral_[i], -INTEGRAL_CLAMP_RP_, INTEGRAL_CLAMP_RP_);
+                pitch_integral_[i] = std::clamp(pitch_integral_[i], -INTEGRAL_CLAMP_RP_, INTEGRAL_CLAMP_RP_);
+
+                double I_term_z = Ki_z_ * z_integral_[i];
+                double I_term_roll = Ki_roll_ * roll_integral_[i];
+                double I_term_pitch = Ki_pitch_ * pitch_integral_[i];
+
+                Eigen::Vector3d force_p = (K_task_ * ez) + (I_term_z * k_rp) + (K_task_2_ * Eigen::Map<Eigen::Vector3d>(xyz_des_));
+                Eigen::Vector3d force_pd = D_task_ * (evx + evy);
+                Eigen::Vector3d torque_R(K_ori_ * e_rp.x() + I_term_roll,
+                                         K_ori_ * e_rp.y() + I_term_pitch,
+                                         0.0);
 
                 tau_task += J_v[i].transpose() * force_p - J_w[i].transpose() * torque_R;
                 tau_task_damper += J_v[i].transpose() * force_pd;
                 target_pos_actual_[i] = Eigen::Vector3d(curr_pos_[i].x(), curr_pos_[i].y(), curr_pos_[i].z()) + Eigen::Map<Eigen::Vector3d>(xyz_des_);
+            }
+
+            // Write average spring errors to SHM (after finger loop)
+            if (spring_err_ptr_ != nullptr) {
+                double avg_z_err = 0.0, avg_roll_err = 0.0, avg_pitch_err = 0.0;
+                for (size_t fi = 0; fi < tip_ids_.size(); ++fi) {
+                    auto ftid = tip_ids_[fi];
+                    Eigen::Vector3d fpos = data_.oMf[ftid].translation();
+                    Eigen::Matrix3d fR = data_.oMf[ftid].rotation();
+                    Eigen::Vector3d feef_y = fR.col(1);
+                    Eigen::Vector3d fip = Ry * i0, fjr = Rx * j0;
+                    Eigen::Vector3d fkrp = fip.cross(fjr);
+                    avg_z_err += fkrp.dot(pos_center - fpos);
+                    avg_roll_err += fkrp.cross(feef_y).x();
+                    avg_pitch_err += fkrp.cross(feef_y).y();
+                }
+                spring_err_ptr_[0] = avg_z_err / 3.0;
+                spring_err_ptr_[1] = avg_roll_err / 3.0;
+                spring_err_ptr_[2] = avg_pitch_err / 3.0;
             }
 
             for (int i = 0; i < model_.nv; ++i) {

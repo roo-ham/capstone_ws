@@ -69,7 +69,7 @@ class BallBalancingNode(Node):
         self.target_ball_x = 0.0
         self.target_ball_y = 0.0
 
-        self.target_data = np.zeros(12)
+        self.target_data = np.zeros(15)
         self.f_xyz_manual = np.zeros(3, np.float64)
 
         self.config_file = 'balance_config.json'
@@ -100,7 +100,7 @@ class BallBalancingNode(Node):
         self.pitch_offset_rad = 0.0
 
         target_defaults = [0.0, 0.0, 0.0, 0.0, 0.0,
-        160.0, 0.35, 0.11, 0.006, 0.04, 1.4, 0.0]
+        160.0, 0.35, 0.11, 0.006, 0.04, 1.4, 0.0, 0.0, 0.0, 0.0]
         self.target_data[:] = target_defaults
 
         try:
@@ -112,7 +112,7 @@ class BallBalancingNode(Node):
                     self.roll_offset_rad = cfg.get('roll_offset_rad', self.roll_offset_rad)
                     self.pitch_offset_rad = cfg.get('pitch_offset_rad', self.pitch_offset_rad)
 
-                    for i in range(5, 12):
+                    for i in range(5, 15):
                         idx_str = str(i)
                         if idx_str in cfg.get('target_data', {}):
                             self.target_data[i] = cfg['target_data'][idx_str]
@@ -124,7 +124,7 @@ class BallBalancingNode(Node):
             'max_tilt_deg': self.max_tilt_deg,
             'roll_offset_rad': self.roll_offset_rad,
             'pitch_offset_rad': self.pitch_offset_rad,
-            'target_data': {str(i): self.target_data[i] for i in range(5, 12)}
+            'target_data': {str(i): self.target_data[i] for i in range(5, 15)}
         }
         try:
             with open(self.config_file, 'w') as f:
@@ -174,7 +174,7 @@ class BallBalancingNode(Node):
         if not self.shm_connected_pose:
             if os.path.exists('/dev/shm/target_pose_shm') and os.path.exists('/dev/shm/eef_pos_shm') and os.path.exists('/dev/shm/eef_force_shm'):
                 self.shm_pose = shared_memory.SharedMemory(name='target_pose_shm', create=False)
-                self.pose_array = np.ndarray((12,), dtype=np.float64, buffer=self.shm_pose.buf)
+                self.pose_array = np.ndarray((15,), dtype=np.float64, buffer=self.shm_pose.buf)
                 
                 self.shm_eef = shared_memory.SharedMemory(name='eef_pos_shm', create=False)
                 self.eef_array = np.ndarray((6,), dtype=np.float64, buffer=self.shm_eef.buf)
