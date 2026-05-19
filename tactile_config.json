@@ -1,14 +1,14 @@
 {
     "cameras": [
         {
-            "b_slider": -2996.0,
-            "k_slider": 0.0326199947455911,
-            "ref_baseline": 2.0,
-            "ref_brightness": 4.469275848025006,
+            "b_slider": -3638.0,
+            "k_slider": 0.03361306552070463,
+            "ref_baseline": 92.11040530202561,
+            "ref_brightness": 90.7167186394598,
             "ref_roi": [
-                40,
-                350,
-                30,
+                280,
+                360,
+                80,
                 30
             ],
             "rpicam_cmd": "rpicam-vid -t 0 --camera 0 --width 640 --height 400 --framerate 120 --codec yuv420 --denoise off --nopreview --awb custom --awbgains 1.5,1.5 --shutter 40000 --gain 7.0 -o - 2>/dev/null",
@@ -24,23 +24,23 @@
                 ],
                 [
                     500,
-                    250
+                    200
                 ],
                 [
                     160,
-                    250
+                    200
                 ]
             ],
             "zero_area": 0.0
         },
         {
-            "b_slider": -43086.0,
-            "k_slider": 0.004394303896206329,
-            "ref_baseline": 60.0,
-            "ref_brightness": 111.28132481490229,
+            "b_slider": -92969.0,
+            "k_slider": 0.006268173239126069,
+            "ref_baseline": 228.71592706282829,
+            "ref_brightness": 228.11321326665814,
             "ref_roi": [
-                40,
-                350,
+                5,
+                5,
                 30,
                 30
             ],
@@ -66,14 +66,14 @@
             "zero_area": 0.0
         },
         {
-            "b_slider": -358.0,
-            "k_slider": 0.037126798724105625,
-            "ref_baseline": 45.0,
-            "ref_brightness": 29.43364228682751,
+            "b_slider": -1941.0,
+            "k_slider": 0.0431746635079126,
+            "ref_baseline": 90.04914842273269,
+            "ref_brightness": 87.52357161525445,
             "ref_roi": [
-                40,
-                350,
-                30,
+                280,
+                360,
+                80,
                 30
             ],
             "rpicam_cmd": "rpicam-vid -t 0 --camera 1 --width 640 --height 400 --framerate 120 --codec yuv420 --denoise off --nopreview --awb custom --awbgains 1.5,1.5 --shutter 50000 --gain 10.0 -o - 2>/dev/null",

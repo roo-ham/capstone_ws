@@ -42,14 +42,6 @@ struct SensorData {
     cv::VideoCapture cap;
     cv::Mat mask;
 
-    // Adaptive threshold (same as tactile_ball_tracker)
-    cv::Rect ref_roi = cv::Rect(5, 5, 30, 30);
-    double ref_brightness = 0.0;
-    double ref_baseline = -1.0;
-    int warmup_count = 0;
-    static constexpr int WARMUP_FRAMES = 200;
-    int thresh = 120;
-    int base_thresh = 120;
 
     // 실시간 상태 변수
     double current_brightness = 0.0;
@@ -119,17 +111,6 @@ public:
                 sensors_[i].trap_pts.push_back(cv::Point(pt[0], pt[1]));
             }
             // reference ROI for adaptive threshold
-            if (cam.contains("ref_roi")) {
-                auto& rr = cam["ref_roi"];
-                sensors_[i].ref_roi = cv::Rect(rr[0], rr[1], rr[2], rr[3]);
-            }
-            // restore adaptive threshold state
-            if (cam.contains("ref_baseline")) {
-                sensors_[i].ref_baseline = cam["ref_baseline"];
-                sensors_[i].ref_brightness = cam.value("ref_brightness", sensors_[i].ref_baseline);
-                sensors_[i].warmup_count = sensors_[i].WARMUP_FRAMES;
-            }
-
             sensors_[i].mask = cv::Mat::zeros(400, 640, CV_8UC1);
             std::vector<std::vector<cv::Point>> pts = {sensors_[i].trap_pts};
             cv::fillPoly(sensors_[i].mask, pts, cv::Scalar(255));
@@ -153,8 +134,6 @@ public:
         for (int i = 0; i < 3; ++i) {
             j["cameras"][i]["k_slider"] = sensors_[i].k_val;
             j["cameras"][i]["b_slider"] = sensors_[i].b_val;
-            j["cameras"][i]["ref_baseline"] = sensors_[i].ref_baseline;
-            j["cameras"][i]["ref_brightness"] = sensors_[i].ref_brightness;
         }
         std::ofstream out(tactile_config_file_);
         out << j.dump(4);
@@ -257,29 +236,9 @@ public:
 
                     if (is_paused_) continue;
 
-                    // Adaptive threshold (same as tactile_ball_tracker)
-                    {
-                        cv::Rect roi = sensor.ref_roi;
-                        if (roi.x + roi.width > frame.cols) roi.width = frame.cols - roi.x;
-                        if (roi.y + roi.height > frame.rows) roi.height = frame.rows - roi.y;
-                        cv::Mat ref_patch = frame(roi);
-                        double raw_ref = cv::mean(ref_patch)[0];
-                        sensor.ref_brightness = 0.995 * sensor.ref_brightness + 0.005 * raw_ref;
-                        if (sensor.ref_baseline < 0.0) {
-                            if (++sensor.warmup_count >= sensor.WARMUP_FRAMES)
-                                sensor.ref_baseline = sensor.ref_brightness;
-                        }
-                        if (sensor.ref_baseline > 0.0) {
-                            double ratio = sensor.ref_brightness / sensor.ref_baseline;
-                            sensor.thresh = (int)(sensor.base_thresh * ratio);
-                            if (sensor.thresh < 80)  sensor.thresh = 80;
-                            if (sensor.thresh > 180) sensor.thresh = 180;
-                        }
-                    }
-
                     cv::Mat masked, thresh_img;
                     cv::bitwise_and(frame, sensor.mask, masked);
-                    cv::threshold(masked, thresh_img, sensor.thresh, 255, cv::THRESH_BINARY);
+                    cv::threshold(masked, thresh_img, 120, 255, cv::THRESH_BINARY);
                     
                     {
                         std::lock_guard<std::mutex> lock(data_mutex_);
@@ -343,33 +302,13 @@ public:
 
                 if (is_paused_) continue;
 
-                // Adaptive threshold (same as tactile_ball_tracker)
-                {
-                    cv::Rect roi = sensor.ref_roi;
-                    if (roi.x + roi.width > gray.cols) roi.width = gray.cols - roi.x;
-                    if (roi.y + roi.height > gray.rows) roi.height = gray.rows - roi.y;
-                    cv::Mat ref_patch = gray(roi);
-                    double raw_ref = cv::mean(ref_patch)[0];
-                    sensor.ref_brightness = 0.995 * sensor.ref_brightness + 0.005 * raw_ref;
-                    if (sensor.ref_baseline < 0.0) {
-                        if (++sensor.warmup_count >= sensor.WARMUP_FRAMES)
-                            sensor.ref_baseline = sensor.ref_brightness;
-                    }
-                    if (sensor.ref_baseline > 0.0) {
-                        double ratio = sensor.ref_brightness / sensor.ref_baseline;
-                        sensor.thresh = (int)(sensor.base_thresh * ratio);
-                        if (sensor.thresh < 80)  sensor.thresh = 80;
-                        if (sensor.thresh > 180) sensor.thresh = 180;
-                    }
-                }
-
                 // [추가된 방어 코드] 들어온 이미지 크기가 마스크 크기(640x400)와 다르면 강제로 맞춥니다.
                 if (gray.size() != sensor.mask.size()) {
                     cv::resize(gray, gray, sensor.mask.size());
                 }
 
                 cv::bitwise_and(gray, sensor.mask, masked);
-                cv::threshold(masked, thresh_img, sensor.thresh, 255, cv::THRESH_BINARY);
+                cv::threshold(masked, thresh_img, 120, 255, cv::THRESH_BINARY);
                 
                 {
                     std::lock_guard<std::mutex> lock(data_mutex_);

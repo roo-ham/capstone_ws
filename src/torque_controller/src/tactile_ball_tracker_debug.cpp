@@ -31,14 +31,6 @@ struct SensorData {
     cv::UMat u_mask;                    
 
     int thresh = 120;
-    int base_thresh = 120;
-
-    // Adaptive threshold: reference brightness tracking (drift compensation)
-    cv::Rect ref_roi = cv::Rect(5, 5, 30, 30);  // configurable via JSON
-    double ref_brightness = 0.0;
-    double ref_baseline = -1.0; // -1 = not initialized
-    int warmup_count = 0;       // baseline warmup counter
-    static constexpr int WARMUP_FRAMES = 200;
     double current_fps = 0.0;
     
     cv::Mat display_img;
@@ -63,7 +55,7 @@ public:
 
             for (int i = 0; i < 3; ++i) {
                 sensors_[i].b_val = -sensors_[i].last_area;
-                // ref_baseline, thresh 는 건드리지 않음 (독립적인 열 drift 보정)
+                // b_val만 업데이트, threshold는 고정 120
             }
 
             // Save b_val to JSON (persist across restarts)
@@ -105,25 +97,6 @@ public:
         running_ = false;
         for (auto& th : capture_threads_) {
             if (th.joinable()) th.join();
-        }
-
-        // Save adaptive threshold state to JSON (persist across restarts)
-        {
-            std::lock_guard<std::mutex> lock(data_mutex_);
-            std::ifstream file("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
-            json j;
-            if (file.is_open()) { file >> j; file.close(); }
-            if (j.contains("cameras")) {
-                for (int i = 0; i < 3; ++i) {
-                    if (j["cameras"].size() > (size_t)i) {
-                        j["cameras"][i]["ref_baseline"] = sensors_[i].ref_baseline;
-                        j["cameras"][i]["ref_brightness"] = sensors_[i].ref_brightness;
-                    }
-                }
-                std::ofstream out("/home/kimdonghwi/capstone_ws_claude/tactile_config.json");
-                if (out.is_open()) { out << j.dump(4); out.close(); }
-                RCLCPP_INFO(this->get_logger(), "Adaptive threshold state saved to tactile_config.json");
-            }
         }
 
         munmap(shm_ptr_, 4 * sizeof(double));
@@ -208,18 +181,6 @@ private:
                 for(auto& pt : j["cameras"][i]["trap_src"]) {
                     sensors_[i].trap_pts.push_back(cv::Point(pt[0], pt[1]));
                 }
-                // reference ROI for adaptive threshold
-                if (j["cameras"][i].contains("ref_roi")) {
-                    auto& rr = j["cameras"][i]["ref_roi"];
-                    sensors_[i].ref_roi = cv::Rect(rr[0], rr[1], rr[2], rr[3]);
-                }
-                // restore adaptive threshold state (persist across restarts)
-                if (j["cameras"][i].contains("ref_baseline")) {
-                    sensors_[i].ref_baseline = j["cameras"][i]["ref_baseline"];
-                    sensors_[i].ref_brightness = j["cameras"][i].value("ref_brightness", sensors_[i].ref_baseline);
-                    sensors_[i].warmup_count = sensors_[i].WARMUP_FRAMES; // skip warmup
-                    RCLCPP_INFO(this->get_logger(), "[Sensor %d] Restored ref baseline: %.2f", i, sensors_[i].ref_baseline);
-                }
             }
             file.close();
         }
@@ -241,8 +202,8 @@ private:
             printf(" Target FPS Limit: %d (Adjust via ROS Param)\n\n", global_fps_limit);
             
             for(int i=0; i<3; ++i) {
-                printf(" [Sensor %d] FPS: %5.1f | Area: %7.1f | Force: %6.2f | Thresh: %3d | Ref: %6.1f\n",
-                       i+1, sensors_[i].current_fps, sensors_[i].last_area, sensors_[i].force, sensors_[i].thresh, sensors_[i].ref_brightness);
+                printf(" [Sensor %d] FPS: %5.1f | Area: %7.1f | Force: %6.2f | Thresh: %3d\n",
+                       i+1, sensors_[i].current_fps, sensors_[i].last_area, sensors_[i].force, sensors_[i].thresh);
                 
                 if(!sensors_[i].display_img.empty()) {
                     disp_imgs[i] = sensors_[i].display_img.clone();
@@ -279,29 +240,7 @@ private:
                     temp_mask.copyTo(sensors_[idx].u_mask);
                 }
 
-                // --- Adaptive threshold: JSON-configurable ROI + warmup ---
-                cv::Rect roi = sensors_[idx].ref_roi;
-                // clamp ROI within frame bounds
-                if (roi.x + roi.width > frame.cols) roi.width = frame.cols - roi.x;
-                if (roi.y + roi.height > frame.rows) roi.height = frame.rows - roi.y;
-                cv::Mat ref_patch = frame(roi);
-                double raw_ref = cv::mean(ref_patch)[0];
-                sensors_[idx].ref_brightness = 0.995 * sensors_[idx].ref_brightness + 0.005 * raw_ref;
-
-                // warmup: wait WARMUP_FRAMES before locking baseline
-                if (sensors_[idx].ref_baseline < 0.0) {
-                    if (++sensors_[idx].warmup_count >= sensors_[idx].WARMUP_FRAMES) {
-                        sensors_[idx].ref_baseline = sensors_[idx].ref_brightness;
-                    }
-                }
-                if (sensors_[idx].ref_baseline > 0.0) {
-                    double ratio = sensors_[idx].ref_brightness / sensors_[idx].ref_baseline;
-                    sensors_[idx].thresh = (int)(sensors_[idx].base_thresh * ratio);
-                    if (sensors_[idx].thresh < 80)  sensors_[idx].thresh = 80;
-                    if (sensors_[idx].thresh > 180) sensors_[idx].thresh = 180;
-                }
-
-                cv::threshold(u_frame, u_binary, sensors_[idx].thresh, 255, cv::THRESH_BINARY);
+                cv::threshold(u_frame, u_binary, 120, 255, cv::THRESH_BINARY);
                 
                 if (!sensors_[idx].u_mask.empty()) {
                     cv::bitwise_and(u_binary, sensors_[idx].u_mask, u_binary);

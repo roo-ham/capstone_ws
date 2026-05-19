@@ -77,9 +77,18 @@ class BallBalancingNode(Node):
         # Z-axis velocity estimation (게인 스케줄링용)
         self.z_vel_filt = 0.0
 
+        # Slow force bias tracking (dead band reference)
+        self.force_bias1 = 0.0; self.force_bias2 = 0.0; self.force_bias3 = 0.0
+
         # 기본 게인 초기화
-        self.Kp_ball = 1.0
-        self.Kd_ball = 0.1
+        self.Kp_ball = 5.0
+        self.Kd_ball = 0.5
+        self.detection_quality = 0.0  # EMA of ball detection confidence
+        # Energy/tuning params for detection quality EMA
+        self.detq_offset = 5.0      # f_total offset subtracted
+        self.detq_scale = 25.0       # f_total normalization scale
+        self.detq_attack = 0.3       # fast drop rate (ball loss)
+        self.detq_recovery = 0.08    # slow recovery rate (ball back)
 
         self.csv_data = [] 
         self.target_data = np.zeros(12)
@@ -111,6 +120,8 @@ class BallBalancingNode(Node):
         self.show_gui = self.get_parameter('show_gui').value
         self.shutdown_flag = False
         self.pause_control()
+
+        self.f_err_prev = None
 
     def load_force_coeffs(self):
         defaults = np.array([
@@ -180,6 +191,10 @@ class BallBalancingNode(Node):
                     
                     self.Kp_ball = cfg.get('Kp_ball', self.Kp_ball)
                     self.Kd_ball = cfg.get('Kd_ball', self.Kd_ball)
+                    self.detq_offset = cfg.get('detq_offset', self.detq_offset)
+                    self.detq_scale = cfg.get('detq_scale', self.detq_scale)
+                    self.detq_attack = cfg.get('detq_attack', self.detq_attack)
+                    self.detq_recovery = cfg.get('detq_recovery', self.detq_recovery)
 
                     for i in range(5, 12):
                         idx_str = str(i)
@@ -196,6 +211,10 @@ class BallBalancingNode(Node):
             'pitch_offset_rad': self.pitch_offset_rad,
             'Kp_ball': self.Kp_ball,
             'Kd_ball': self.Kd_ball,
+            'detq_offset': self.detq_offset,
+            'detq_scale': self.detq_scale,
+            'detq_attack': self.detq_attack,
+            'detq_recovery': self.detq_recovery,
             'force_c0_s1': self.force_coeffs[0][0],
             'force_c0_s2': self.force_coeffs[1][0],
             'force_c0_s3': self.force_coeffs[2][0],
@@ -263,8 +282,9 @@ class BallBalancingNode(Node):
 
         self.loop_count += 1
         now = time.time()
-        if now - self.last_freq_time >= 1.0:
-            self.actual_freq = self.loop_count / (now - self.last_freq_time)
+        dt = (now - self.last_freq_time)
+        if dt >= 1.0:
+            self.actual_freq = self.loop_count / dt
             self.loop_count = 0
             self.last_freq_time = now
 
@@ -338,22 +358,48 @@ class BallBalancingNode(Node):
             self.ball_detected = (f_total >= F_TOTAL_MIN)
             self.prev_ball_detected = self.ball_detected or self.prev_ball_detected
 
-            # --- 7. PD 제어 + Z속도 기반 적응형 게인 ---
+            # --- Detection quality: EMA of f_total (fast attack, slow decay, never stuck) ---
+            target_q = np.clip((f_total - self.detq_offset) / self.detq_scale, 0.0, 1.0)
+            alpha_q = self.detq_attack if target_q < self.detection_quality else self.detq_recovery
+            self.detection_quality += alpha_q * (target_q - self.detection_quality)
+
+            # --- 7. PD 제어 + Z속도 + detection quality ---
             z_vel_mag = abs(self.z_vel_filt)
             if z_vel_mag > 0.01:
                 gain_scale = max(0.15, 1.0 - z_vel_mag / 0.05)
             else:
                 gain_scale = 1.0
 
-            Kp_active = self.Kp_ball * gain_scale
-            Kd_active = self.Kd_ball * gain_scale
+            Kp_active = self.Kp_ball * gain_scale * self.detection_quality
+            Kd_active = self.Kd_ball * gain_scale * self.detection_quality
 
             cmd_tilt = np.zeros(2)
-            if not self.is_paused and self.ball_detected:
-                err_x = self.target_ball_x - self.curr_ball_x
-                err_y = self.target_ball_y - self.curr_ball_y
-                cmd_tilt[0] = Kp_active * err_x + Kd_active * (0.0 - self.curr_ball_vx)
-                cmd_tilt[1] = Kp_active * err_y + Kd_active * (0.0 - self.curr_ball_vy)
+
+            FORCE_BIAS = 15
+            DEAD_BAND = 15
+            f_err = np.array([self.curr_f1_res, self.curr_f2_res, self.curr_f3_res]) - FORCE_BIAS
+            mask = np.abs(f_err) > DEAD_BAND
+            f_err = np.where(mask, f_err - np.sign(f_err) * DEAD_BAND, 0.0)
+            if not self.f_err_prev is None:
+                df_err = (f_err - self.f_err_prev) / dt
+            else:
+                df_err = np.zeros_like(f_err)
+                self.f_err_prev = f_err.copy()
+
+            f_vz = np.array([f1_vz, f2_vz, f3_vz])
+            dirs = np.array([[0.7, -0.7], [-0.7, -0.7], [0.0, 1.0]])
+            acts = dirs * (self.Kp_ball * f_err[:, None] + self.Kd_ball * df_err[:, None])
+            act_1, act_2, act_3 = acts[0], acts[1], acts[2]
+
+
+            # if not self.is_paused and self.detection_quality > 0.1:
+            #     err_x = self.target_ball_x - self.curr_ball_x
+            #     err_y = self.target_ball_y - self.curr_ball_y
+            #     cmd_tilt[0] = Kp_active * err_x + Kd_active * (0.0 - self.curr_ball_vx)
+            #     cmd_tilt[1] = Kp_active * err_y + Kd_active * (0.0 - self.curr_ball_vy)
+
+            if not self.is_paused:
+                cmd_tilt = (act_1 + act_2 + act_3) / 3
 
             cmd_tilt = np.clip(cmd_tilt, -self.MAX_TILT_RAD, self.MAX_TILT_RAD)
 
@@ -378,6 +424,7 @@ class BallBalancingNode(Node):
                 self.target_data[2], self.target_data[5], self.target_data[6],
                 cop_x_raw, cop_y_raw, f_total,
                 bx, by,  # raw CoP before Kalman
+                self.detection_quality,
                 self.kf_P.trace()
             ] + eef_vel + eef_cur)
 
@@ -445,15 +492,43 @@ class TuningUI:
 
         self.lbl_kp_ball = ttk.Label(pd_frame, text=f"Kp_ball: {self.node.Kp_ball:.3f}", width=20)
         self.lbl_kp_ball.pack(anchor='w')
-        self.sl_kp_ball = ttk.Scale(pd_frame, from_=0.0, to=0.5, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
+        self.sl_kp_ball = ttk.Scale(pd_frame, from_=-0.1, to=0.1, orient='horizontal', command=lambda v: self.update_ball_gain("Kp", v))
         self.sl_kp_ball.set(self.node.Kp_ball)
         self.sl_kp_ball.pack(fill='x', expand=True, pady=(0,5))
 
         self.lbl_kd_ball = ttk.Label(pd_frame, text=f"Kd_ball: {self.node.Kd_ball:.3f}", width=20)
         self.lbl_kd_ball.pack(anchor='w')
-        self.sl_kd_ball = ttk.Scale(pd_frame, from_=0.0, to=0.1, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
+        self.sl_kd_ball = ttk.Scale(pd_frame, from_=-5.0, to=5.0, orient='horizontal', command=lambda v: self.update_ball_gain("Kd", v))
         self.sl_kd_ball.set(self.node.Kd_ball)
         self.sl_kd_ball.pack(fill='x', expand=True)
+
+        # --- [Left] Detection Quality (Energy) Params ---
+        detq_frame = ttk.LabelFrame(left_col, text=" Detection Quality (DetQ) Params ", padding=5)
+        detq_frame.pack(fill='x', pady=5)
+
+        self.lbl_detq_offset = ttk.Label(detq_frame, text=f"DetQ Offset: {self.node.detq_offset:.1f} gf", width=35)
+        self.lbl_detq_offset.pack(anchor='w')
+        self.sl_detq_offset = ttk.Scale(detq_frame, from_=0.0, to=20.0, orient='horizontal', command=lambda v: self.update_detq("offset", v))
+        self.sl_detq_offset.set(self.node.detq_offset)
+        self.sl_detq_offset.pack(fill='x', expand=True)
+
+        self.lbl_detq_scale = ttk.Label(detq_frame, text=f"DetQ Scale: {self.node.detq_scale:.1f} gf", width=35)
+        self.lbl_detq_scale.pack(anchor='w')
+        self.sl_detq_scale = ttk.Scale(detq_frame, from_=5.0, to=100.0, orient='horizontal', command=lambda v: self.update_detq("scale", v))
+        self.sl_detq_scale.set(self.node.detq_scale)
+        self.sl_detq_scale.pack(fill='x', expand=True)
+
+        self.lbl_detq_attack = ttk.Label(detq_frame, text=f"DetQ Attack: {self.node.detq_attack:.2f}", width=35)
+        self.lbl_detq_attack.pack(anchor='w')
+        self.sl_detq_attack = ttk.Scale(detq_frame, from_=0.05, to=0.8, orient='horizontal', command=lambda v: self.update_detq("attack", v))
+        self.sl_detq_attack.set(self.node.detq_attack)
+        self.sl_detq_attack.pack(fill='x', expand=True)
+
+        self.lbl_detq_recovery = ttk.Label(detq_frame, text=f"DetQ Recovery: {self.node.detq_recovery:.2f}", width=35)
+        self.lbl_detq_recovery.pack(anchor='w')
+        self.sl_detq_recovery = ttk.Scale(detq_frame, from_=0.01, to=0.4, orient='horizontal', command=lambda v: self.update_detq("recovery", v))
+        self.sl_detq_recovery.set(self.node.detq_recovery)
+        self.sl_detq_recovery.pack(fill='x', expand=True)
 
         # --- [Left] 제어 각도 한계 제어 ---
         limit_frame = ttk.LabelFrame(left_col, text=" Control Limits ", padding=5)
@@ -544,8 +619,10 @@ class TuningUI:
         
         btn_pause = ttk.Button(ctrl_btn_frame, text="Pause (Manual Tilt Only)", command=self.node.pause_control)
         btn_pause.pack(side='left', expand=True, padx=2)
-        btn_resume = ttk.Button(ctrl_btn_frame, text="Resume Control (PD ON)", command=self.node.resume_control)
-        btn_resume.pack(side='right', expand=True, padx=2)
+        self.btn_resume = ttk.Button(ctrl_btn_frame, text="Auto-zero (5s)...", command=self.node.resume_control, state='disabled')
+        self.btn_resume.pack(side='right', expand=True, padx=2)
+        # Enable after 5s auto-zero
+        self.root.after(5000, self.enable_resume_button)
         
         btn_zero = ttk.Button(right_col, text="Set Force Zero (Tactile Offset)", command=self.node.set_force_zero)
         btn_zero.pack(fill='x', pady=2)
@@ -555,6 +632,9 @@ class TuningUI:
             cv2.namedWindow("Ball & EEF Position Map", cv2.WINDOW_AUTOSIZE)
 
         self.update_ui_loop()
+
+    def enable_resume_button(self):
+        self.btn_resume.config(text="Resume Control (PD ON)", state='normal')
 
     def action_load_config(self):
         self.node.load_config()
@@ -567,6 +647,10 @@ class TuningUI:
         self.slider_c0_s1.set(self.node.force_coeffs[0][0])
         self.slider_c0_s2.set(self.node.force_coeffs[1][0])
         self.slider_c0_s3.set(self.node.force_coeffs[2][0])
+        self.sl_detq_offset.set(self.node.detq_offset)
+        self.sl_detq_scale.set(self.node.detq_scale)
+        self.sl_detq_attack.set(self.node.detq_attack)
+        self.sl_detq_recovery.set(self.node.detq_recovery)
         
         for name, idx, _ in self.gains_def_list:
             self.hw_sliders[name].set(self.node.target_data[idx])
@@ -619,6 +703,21 @@ class TuningUI:
         elif idx == 2:
             self.lbl_c0_s3.config(text=f"Sensor 3 c0: {val:>7.3f}")
 
+    def update_detq(self, name, value):
+        val = float(value)
+        if name == "offset":
+            self.node.detq_offset = val
+            self.lbl_detq_offset.config(text=f"DetQ Offset: {val:.1f} gf")
+        elif name == "scale":
+            self.node.detq_scale = val
+            self.lbl_detq_scale.config(text=f"DetQ Scale: {val:.1f} gf")
+        elif name == "attack":
+            self.node.detq_attack = val
+            self.lbl_detq_attack.config(text=f"DetQ Attack: {val:.2f}")
+        elif name == "recovery":
+            self.node.detq_recovery = val
+            self.lbl_detq_recovery.config(text=f"DetQ Recovery: {val:.2f}")
+
     def update_ui_loop(self):
         if self.node.shutdown_flag:
             self.root.quit()
@@ -638,7 +737,7 @@ class TuningUI:
                 self.lbl_ball_pos.config(text="Pos (X, Y):      - ,      -")
                 self.lbl_ball_vel.config(text="Vel (Vx, Vy):     - ,      -")
         
-        self.lbl_actual_freq.config(text=f"Actual Freq: {self.node.actual_freq:>5.1f} Hz | Z_vel: {self.node.z_vel_filt:>6.3f} m/s | Gain: {self.node.Kp_ball * (max(0.15, 1.0 - abs(self.node.z_vel_filt)/0.05) if abs(self.node.z_vel_filt) > 0.01 else 1.0):.3f}")
+        self.lbl_actual_freq.config(text=f"Actual Freq: {self.node.actual_freq:>5.1f} Hz | Z_vel: {self.node.z_vel_filt:>6.3f} m/s | DetQ: {self.node.detection_quality:.2f}")
 
         if self.node.shm_connected_pose and self.node.eef_force_array is not None:
             self.lbl_eef_force.config(text=f"EEF Forces (gf) - F1: {self.node.eef_force_array[0]:>6.1f} | F2: {self.node.eef_force_array[1]:>6.1f} | F3: {self.node.eef_force_array[2]:>6.1f}")
@@ -719,7 +818,7 @@ def main(args=None):
                         'z_vel_filt', 'gain_scale',
                         'xyz_des_z', 'K_task', 'D_task',
                         'cop_x_raw', 'cop_y_raw', 'f_total',
-                        'cop_x_meas', 'cop_y_meas', 'kf_P_trace',
+                        'cop_x_meas', 'cop_y_meas', 'detection_quality', 'kf_P_trace',
                         'eef_v1_x', 'eef_v1_y', 'eef_v1_z',
                         'eef_v2_x', 'eef_v2_y', 'eef_v2_z',
                         'eef_v3_x', 'eef_v3_y', 'eef_v3_z',

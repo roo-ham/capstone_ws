@@ -291,8 +291,8 @@ private:
                     eef_dot_ptr_[i * 3 + 2] = curr_vel_[i].z();
                 }
 
-                Eigen::Vector3d evx = i_pitch.dot(curr_vel_[i] - vel_center) * i_pitch;
-                Eigen::Vector3d evy = j_roll.dot(curr_vel_[i] - vel_center) * j_roll;
+                Eigen::Vector3d evx = i_pitch.dot(curr_vel_[i]) * i_pitch;
+                Eigen::Vector3d evy = j_roll.dot(curr_vel_[i]) * j_roll;
                 Eigen::Vector3d ez = k_rp.dot(pos_center - curr_pos_[i]) * k_rp;
 
                 Eigen::Vector3d force_p = (K_task_ * ez) + (K_task_2_ * Eigen::Map<Eigen::Vector3d>(xyz_des_));
